@@ -1,0 +1,32 @@
+Models & Quota
+
+  Account: person@example.com
+
+GEMINI MODELS
+  Models within this group: Gemini Flash, Gemini Pro
+
+  Weekly Limit
+    [██████████████████████████████████████████████████] 99.19%
+    99% remaining · Refreshes in 47h 3m
+
+  Five Hour Limit
+    [█████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 18.00%
+    18% remaining · Refreshes in 5h 0m
+
+
+CLAUDE AND GPT MODELS
+  Models within this group: Claude Opus, Claude Sonnet, GPT-OSS
+
+  Weekly Limit
+    [██████████████████████████████████████████████████] 100.00%
+    Quota available
+
+  Five Hour Limit
+    [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 0.00%
+    Quota exhausted
+
+
+  │Within each group, models share a weekly limit and a 5-hour limit. Quota is
+  │consumed proportionally to the cost of the tokens.
+
+  ↑/↓ Scroll · pgup/pgdown Page · ctrl+end Bottom · ctrl+home Top · esc Close

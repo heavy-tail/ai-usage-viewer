@@ -1,0 +1,18 @@
+{
+  "enabledProviders": ["claude", "codex", "agy", "grok"],
+  "codex": {
+    "collectDefault": true,
+    "additionalModelsForContext": []
+  },
+  "agy": {
+    "pinnedGroups": []
+  },
+  "timezone": "UTC",
+  "grokCommand": "grok",
+  "planLabelFallback": {
+    "claude": "Max",
+    "codex": "ChatGPT",
+    "agy": "Google AI Pro",
+    "grok": "SuperGrok"
+  }
+}

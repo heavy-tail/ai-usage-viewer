@@ -1,0 +1,12 @@
+node_modules
+dist
+data
+*.tsbuildinfo
+*.local
+.DS_Store
+
+# Personal local config — each user keeps their own (copy config.example.json)
+config.json
+
+# Local-only deploy notes
+DEPLOY_PLAN.md

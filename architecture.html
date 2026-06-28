@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Usage Viewer — Architecture</title>
+<style>
+  :root{
+    --bg:#090c12; --panel:#10151e; --panel-2:#0c111a; --panel-hover:#141b27;
+    --border:#1d2533; --border-strong:#2a3445;
+    --text:#eaeef5; --text-dim:#9aa6b6; --text-faint:#66718a;
+    --accent:#6366f1; --accent-2:#818cf8;
+    --st-green:#34d399; --st-green-bg:rgba(52,211,153,.13);
+    --st-amber:#fbbf24; --st-amber-bg:rgba(251,191,36,.13);
+    --st-red:#f87171;   --st-red-bg:rgba(248,113,113,.13);
+    --st-orange:#fb923c;--st-orange-bg:rgba(251,146,60,.15);
+    --st-purple:#a78bfa;--st-purple-bg:rgba(167,139,250,.15);
+    --st-gray:#8b97a8;  --st-gray-bg:rgba(139,151,168,.13);
+    /* provider accents */
+    --p-claude:#d97757; --p-codex:#10a37f; --p-agy:#4285f4; --p-grok:#cbd5e1;
+    --radius:14px; --radius-sm:9px;
+    --shadow:0 1px 0 rgba(255,255,255,.025) inset, 0 12px 34px -16px rgba(0,0,0,.7);
+    --font:"Geist Variable",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:"Geist Mono Variable",ui-monospace,"SF Mono","Cascadia Code","Segoe UI Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:var(--font); font-size:15px; line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(900px 480px at 78% -8%, rgba(99,102,241,.16), transparent 60%),
+      radial-gradient(760px 420px at 6% 4%, rgba(52,211,153,.07), transparent 55%);
+    background-attachment:fixed;
+  }
+  a{color:var(--accent-2); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,.mono{font-family:var(--mono)}
+  .mono{font-size:.9em; color:var(--text)}
+  .muted{color:var(--text-dim)} .faint{color:var(--text-faint)}
+
+  /* topbar */
+  .topbar{
+    position:sticky; top:0; z-index:30;
+    display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+    padding:13px 28px;
+    background:rgba(9,12,18,.72); backdrop-filter:blur(12px);
+    border-bottom:1px solid var(--border);
+  }
+  .brand{display:flex; align-items:center; gap:11px}
+  .brand h1{font-size:15.5px; font-weight:650; letter-spacing:-.022em; margin:0}
+  .brand .tag{font-size:11px; color:var(--text-faint); font-family:var(--mono)}
+  .nav{display:flex; gap:4px; margin-left:auto; flex-wrap:wrap}
+  .nav a{
+    color:var(--text-dim); font-size:12.5px; font-weight:550;
+    padding:6px 11px; border-radius:8px; border:1px solid transparent;
+  }
+  .nav a:hover{color:var(--text); background:var(--panel-hover); border-color:var(--border); text-decoration:none}
+
+  /* layout */
+  .wrap{max-width:1120px; margin:0 auto; padding:0 28px 90px}
+  section{padding-top:46px}
+  .eyebrow{
+    font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent-2); margin:0 0 10px;
+  }
+  h2{font-size:25px; font-weight:680; letter-spacing:-.02em; margin:0 0 8px}
+  h3{font-size:16px; font-weight:620; letter-spacing:-.01em; margin:0 0 6px}
+  p{margin:0 0 14px; color:var(--text-dim); max-width:74ch}
+  .lead{font-size:16.5px; color:var(--text-dim)}
+
+  /* hero */
+  .hero{padding-top:64px}
+  .hero h1{
+    font-size:46px; line-height:1.05; font-weight:720; letter-spacing:-.035em;
+    margin:0 0 16px; color:var(--text); max-width:18ch;
+  }
+  .hero h1 .grad{
+    background:linear-gradient(92deg,var(--accent-2),var(--st-green));
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  .hero p{font-size:18px; max-width:70ch}
+  .pillrow{display:flex; gap:9px; flex-wrap:wrap; margin:22px 0 0}
+  .pill{
+    display:inline-flex; align-items:center; gap:7px;
+    font-size:12.5px; font-weight:560; color:var(--text-dim);
+    background:var(--panel); border:1px solid var(--border-strong);
+    padding:7px 12px; border-radius:999px;
+  }
+  .pill .dot{width:7px;height:7px;border-radius:50%}
+
+  /* stat strip */
+  .stats{display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:34px}
+  .stat{
+    background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--border); border-radius:var(--radius); padding:18px 18px 16px;
+    box-shadow:var(--shadow);
+  }
+  .stat .n{font-size:30px; font-weight:720; letter-spacing:-.03em; font-variant-numeric:tabular-nums}
+  .stat .l{font-size:12.5px; color:var(--text-faint); margin-top:3px}
+
+  /* generic card */
+  .card{
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:var(--radius); box-shadow:var(--shadow); padding:20px 22px;
+  }
+  .grid-2{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px}
+  .grid-3{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px}
+  .grid-4{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px}
+
+  .chip{
+    display:inline-block; font-family:var(--mono); font-size:10.5px; text-transform:uppercase;
+    letter-spacing:.05em; color:var(--text-dim); background:var(--panel-2);
+    border:1px solid var(--border); padding:2px 8px; border-radius:6px; font-weight:600;
+  }
+
+  /* provider cards */
+  .prov{position:relative; overflow:hidden}
+  .prov::before{content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--pc)}
+  .prov .ph{display:flex; align-items:center; gap:11px; margin-bottom:12px}
+  .prov .mk{
+    width:34px; height:34px; border-radius:9px; flex:none;
+    display:flex; align-items:center; justify-content:center;
+    font-family:var(--mono); font-weight:700; font-size:14px; color:#0b0e14;
+    background:var(--pc);
+  }
+  .prov .pn{font-weight:640; font-size:15px}
+  .prov .pp{font-size:12px; color:var(--text-faint); font-family:var(--mono)}
+  .prov ul{margin:6px 0 0; padding-left:18px}
+  .prov li{font-size:13px; color:var(--text-dim); margin:3px 0}
+
+  /* the demo usage bar (echoes the real UI) */
+  .ubar{height:7px; border-radius:999px; background:var(--panel-2); border:1px solid var(--border); overflow:hidden; margin-top:10px}
+  .ufill{height:100%; border-radius:999px; background:var(--tone,var(--st-green)); width:0; animation:grow 1.1s cubic-bezier(.22,1,.36,1) forwards}
+  @keyframes grow{to{width:var(--w,60%)}}
+
+  /* flow / pipeline */
+  .flow{
+    display:flex; align-items:stretch; gap:0; flex-wrap:wrap;
+    background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius);
+    padding:18px; margin-top:6px;
+  }
+  .step{
+    flex:1 1 0; min-width:150px; position:relative;
+    padding:14px 16px; text-align:center;
+  }
+  .step .ic{font-size:20px; line-height:1; margin-bottom:9px}
+  .step .t{font-weight:620; font-size:13.5px; margin-bottom:3px}
+  .step .d{font-size:11.5px; color:var(--text-faint); font-family:var(--mono)}
+  .step:not(:last-child)::after{
+    content:"→"; position:absolute; right:-9px; top:50%; transform:translateY(-50%);
+    color:var(--accent-2); font-size:18px; z-index:2;
+  }
+  @media(max-width:760px){
+    .step:not(:last-child)::after{content:"↓"; right:auto; left:50%; top:auto; bottom:-12px; transform:translateX(-50%)}
+  }
+
+  /* layered architecture */
+  .layer{
+    border:1px solid var(--border); border-radius:var(--radius); padding:16px 18px; margin-bottom:14px;
+    background:linear-gradient(180deg,var(--panel),var(--panel-2)); position:relative;
+  }
+  .layer .lh{display:flex; align-items:center; gap:9px; margin-bottom:12px}
+  .layer .lh .chip{border-color:var(--border-strong)}
+  .layer .lh h3{margin:0}
+  .layer .lh .side{margin-left:auto; font-size:11.5px; color:var(--text-faint); font-family:var(--mono)}
+  .boxes{display:flex; gap:10px; flex-wrap:wrap}
+  .box{
+    flex:1 1 120px; background:var(--panel-2); border:1px solid var(--border-strong);
+    border-radius:var(--radius-sm); padding:11px 13px;
+  }
+  .box b{display:block; font-size:13px; font-weight:600}
+  .box span{display:block; font-size:11.5px; color:var(--text-faint); font-family:var(--mono); margin-top:2px}
+  .arrowdown{text-align:center; color:var(--accent-2); font-size:16px; margin:-6px 0 8px; letter-spacing:.3em}
+
+  /* tree */
+  .tree{
+    font-family:var(--mono); font-size:13px; line-height:1.85; color:var(--text-dim);
+    background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius);
+    padding:18px 20px; overflow:auto; white-space:pre; tab-size:2;
+  }
+  .tree .dir{color:var(--accent-2); font-weight:600}
+  .tree .f{color:var(--text)}
+  .tree .c{color:var(--text-faint)}
+
+  /* data model */
+  .type .th{font-family:var(--mono); font-size:13px; font-weight:650; color:var(--st-green); margin-bottom:10px}
+  .field{display:flex; gap:10px; padding:5px 0; border-bottom:1px dashed var(--border); font-size:13px}
+  .field:last-child{border-bottom:none}
+  .field .k{font-family:var(--mono); color:var(--accent-2); min-width:118px; flex:none}
+  .field .v{color:var(--text-dim)}
+  .field .opt{color:var(--text-faint); font-size:11px}
+
+  /* table */
+  table{width:100%; border-collapse:collapse; font-size:13.5px}
+  th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--border)}
+  th{font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--text-faint); font-weight:600}
+  td .mono{color:var(--text)}
+  td.role{color:var(--text-dim)}
+
+  .note{
+    border-left:3px solid var(--accent); background:rgba(99,102,241,.07);
+    padding:12px 16px; border-radius:0 var(--radius-sm) var(--radius-sm) 0; margin:14px 0;
+    font-size:13.5px; color:var(--text-dim);
+  }
+  .note b{color:var(--text)}
+
+  /* status legend dots */
+  .legend{display:flex; gap:14px; flex-wrap:wrap; margin-top:4px}
+  .leg{display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--text-dim)}
+  .leg .dot{width:9px;height:9px;border-radius:50%}
+
+  footer{margin-top:60px; padding-top:22px; border-top:1px solid var(--border); color:var(--text-faint); font-size:12.5px}
+
+  @media(max-width:860px){
+    .stats,.grid-4{grid-template-columns:repeat(2,1fr)}
+    .grid-2,.grid-3{grid-template-columns:1fr}
+    .hero h1{font-size:36px}
+    .wrap{padding:0 18px 70px}
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="1" y="9" width="3.2" height="6" rx="1.2" fill="var(--text-faint)"/>
+      <rect x="6.4" y="5" width="3.2" height="10" rx="1.2" fill="var(--text-dim)"/>
+      <rect x="11.8" y="1" width="3.2" height="14" rx="1.2" fill="var(--st-green)"/>
+    </svg>
+    <h1>AI Usage Viewer</h1>
+    <span class="tag">architecture</span>
+  </div>
+  <nav class="nav">
+    <a href="#what">What</a>
+    <a href="#how">How it works</a>
+    <a href="#arch">Architecture</a>
+    <a href="#flow">Data flow</a>
+    <a href="#structure">Structure</a>
+    <a href="#model">Data model</a>
+    <a href="#decisions">Design</a>
+    <a href="#deps">Dependencies</a>
+  </nav>
+</div>
+
+<div class="wrap">
+
+  <!-- HERO -->
+  <header class="hero">
+    <h1>One dashboard for <span class="grad">every AI CLI's</span> usage limits.</h1>
+    <p class="lead">
+      A local-only dashboard that reads how much of your quota you've burned across
+      <b>Claude Code</b>, <b>Codex</b>, <b>Antigravity</b>, and <b>Grok</b> — by driving each
+      tool's own CLI and parsing what it prints, then showing it as clean, color-graded bars.
+    </p>
+    <div class="pillrow">
+      <span class="pill"><span class="dot" style="background:var(--st-green)"></span>Runs 100% on localhost</span>
+      <span class="pill"><span class="dot" style="background:var(--accent-2)"></span>TypeScript end-to-end</span>
+      <span class="pill"><span class="dot" style="background:var(--st-amber)"></span>No vendor APIs — reads the CLIs</span>
+      <span class="pill"><span class="dot" style="background:var(--st-purple)"></span>Secrets redacted before storage</span>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="n">4</div><div class="l">providers unified</div></div>
+      <div class="stat"><div class="n">~2.0k</div><div class="l">lines of source</div></div>
+      <div class="stat"><div class="n">40</div><div class="l">passing tests</div></div>
+      <div class="stat"><div class="n">3</div><div class="l">runnable processes</div></div>
+    </div>
+  </header>
+
+  <!-- WHAT -->
+  <section id="what">
+    <p class="eyebrow">01 — The idea</p>
+    <h2>What it is</h2>
+    <p>
+      If you pay for several AI coding tools at once, each one tracks your remaining quota in a
+      different place, in a different format, behind a different command. There's no single
+      "how much do I have left everywhere?" view. This app is that view.
+    </p>
+    <p>
+      The catch — and the defining design constraint — is that none of these tools expose a usage
+      <i>API</i>. So instead of calling an endpoint, the app <b>launches each CLI in a real
+      terminal, types the usage command for you, reads the screen, and extracts the numbers</b>.
+      Everything below follows from that one decision.
+    </p>
+
+    <div class="grid-4" style="margin-top:18px">
+      <div class="card prov" style="--pc:var(--p-claude)">
+        <div class="ph"><div class="mk">C</div><div><div class="pn">Claude Code</div><div class="pp">claude → /usage</div></div></div>
+        <ul><li>Session + weekly limits</li><li>All-models &amp; Sonnet-only</li></ul>
+        <div class="ubar"><div class="ufill" style="--w:18%;--tone:var(--st-green)"></div></div>
+      </div>
+      <div class="card prov" style="--pc:var(--p-codex)">
+        <div class="ph"><div class="mk">Cx</div><div><div class="pn">Codex</div><div class="pp">codex → /status</div></div></div>
+        <ul><li>5h + weekly windows</li><li>Context-left (info row)</li></ul>
+        <div class="ubar"><div class="ufill" style="--w:62%;--tone:var(--st-amber)"></div></div>
+      </div>
+      <div class="card prov" style="--pc:var(--p-agy)">
+        <div class="ph"><div class="mk">A</div><div><div class="pn">Antigravity</div><div class="pp">agy → /quota</div></div></div>
+        <ul><li>Per-model quota</li><li>Pinnable model list</li></ul>
+        <div class="ubar"><div class="ufill" style="--w:44%;--tone:var(--st-green)"></div></div>
+      </div>
+      <div class="card prov" style="--pc:var(--p-grok)">
+        <div class="ph"><div class="mk" style="color:#0b0e14">G</div><div><div class="pn">Grok</div><div class="pp">wsl → grok → /usage</div></div></div>
+        <ul><li>Free-credit usage</li><li>Runs through WSL</li></ul>
+        <div class="ubar"><div class="ufill" style="--w:93%;--tone:var(--st-red)"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- HOW -->
+  <section id="how">
+    <p class="eyebrow">02 — The hard part</p>
+    <h2>How it actually reads a CLI</h2>
+    <p>
+      Because these are <i>interactive</i> terminal apps, you can't just capture their output —
+      you have to <b>have a conversation with them</b>. The PTY engine (<code>src/collectors/pty.ts</code>)
+      spawns the program in a pseudo-terminal and runs a scripted sequence of "wait for this text,
+      then type that" steps, plus background "responders" that auto-dismiss prompts like update
+      notices or trust dialogs.
+    </p>
+    <div class="flow">
+      <div class="step"><div class="ic">🖥️</div><div class="t">Spawn PTY</div><div class="d">node-pty</div></div>
+      <div class="step"><div class="ic">⌨️</div><div class="t">Drive prompts</div><div class="d">wait → send</div></div>
+      <div class="step"><div class="ic">🧹</div><div class="t">Clean output</div><div class="d">strip ANSI</div></div>
+      <div class="step"><div class="ic">🔍</div><div class="t">Parse numbers</div><div class="d">regex</div></div>
+      <div class="step"><div class="ic">📐</div><div class="t">Normalize</div><div class="d">UsageLimit</div></div>
+      <div class="step"><div class="ic">🛡️</div><div class="t">Redact</div><div class="d">emails/ids</div></div>
+    </div>
+    <div class="note">
+      <b>Why "drift" is a first-class concept.</b> Terminal output is not a contract. When a vendor
+      changes their CLI's wording, the regex stops matching — so the parser throws a
+      <code>ParserDriftError</code> and the provider is marked <span class="mono">drift</span>
+      instead of crashing. The app keeps showing your last-known numbers and flags that parsing
+      needs an update. This is the single biggest source of long-term maintenance.
+    </div>
+  </section>
+
+  <!-- ARCHITECTURE -->
+  <section id="arch">
+    <p class="eyebrow">03 — The shape</p>
+    <h2>Architecture at a glance</h2>
+    <p>Three runnable pieces, one shared core. The browser never talks to a CLI directly — it only ever sees a clean, redacted JSON snapshot.</p>
+
+    <div class="layer" style="--pc:var(--accent)">
+      <div class="lh"><span class="chip">UI</span><h3>React dashboard</h3><span class="side">src/App.tsx · components/ · Vite</span></div>
+      <div class="boxes">
+        <div class="box"><b>App.tsx</b><span>state, polling, refresh queue</span></div>
+        <div class="box"><b>ProviderCard</b><span>per-provider panel</span></div>
+        <div class="box"><b>UsageRow</b><span>color-graded bars</span></div>
+        <div class="box"><b>api.ts</b><span>typed fetch client</span></div>
+      </div>
+    </div>
+    <div class="arrowdown">▼ &nbsp; HTTP (GET /api/snapshot · POST /api/refresh) &nbsp; ▼</div>
+
+    <div class="layer">
+      <div class="lh"><span class="chip">SERVER</span><h3>Local collector API</h3><span class="side">src/server.ts · node:http · 127.0.0.1:4317</span></div>
+      <div class="boxes">
+        <div class="box"><b>/api/snapshot</b><span>read stored JSON</span></div>
+        <div class="box"><b>/api/refresh</b><span>run all collectors</span></div>
+        <div class="box"><b>/api/refresh/:p</b><span>one provider</span></div>
+        <div class="box"><b>/api/raw/:p</b><span>debug raw text</span></div>
+      </div>
+    </div>
+    <div class="arrowdown">▼ &nbsp; refreshService (in-flight lock) &nbsp; ▼</div>
+
+    <div class="layer">
+      <div class="lh"><span class="chip">CORE</span><h3>Refresh · merge · store</h3><span class="side">src/refresh.ts · storage.ts · config.ts</span></div>
+      <div class="boxes">
+        <div class="box"><b>refresh.ts</b><span>orchestrate + merge stale</span></div>
+        <div class="box"><b>storage.ts</b><span>read/write snapshot + raw</span></div>
+        <div class="box"><b>redaction.ts</b><span>scrub secrets</span></div>
+        <div class="box"><b>config.ts</b><span>config.json + defaults</span></div>
+      </div>
+    </div>
+    <div class="arrowdown">▼ &nbsp; per-provider collect() &nbsp; ▼</div>
+
+    <div class="layer">
+      <div class="lh"><span class="chip">COLLECTORS</span><h3>Drive CLIs &amp; parse</h3><span class="side">src/collectors/ · parsers/ · lib/</span></div>
+      <div class="boxes">
+        <div class="box"><b>collectors/*</b><span>claude·codex·agy·grok</span></div>
+        <div class="box"><b>pty.ts</b><span>terminal automation</span></div>
+        <div class="box"><b>parsers/*</b><span>text → UsageLimit</span></div>
+        <div class="box"><b>lib/terminal·percent</b><span>clean + math</span></div>
+      </div>
+    </div>
+    <div class="arrowdown" style="color:var(--text-faint)">▼ &nbsp; spawns &nbsp; ▼</div>
+    <div class="layer" style="background:var(--panel-2)">
+      <div class="lh"><span class="chip">EXTERNAL</span><h3>The real CLIs on your machine</h3><span class="side">claude · codex · agy · wsl→grok</span></div>
+    </div>
+  </section>
+
+  <!-- DATA FLOW -->
+  <section id="flow">
+    <p class="eyebrow">04 — End to end</p>
+    <h2>What one refresh looks like</h2>
+    <div class="card">
+      <ol style="margin:0; padding-left:22px; color:var(--text-dim); line-height:1.9">
+        <li>You click <b>Refresh</b> → <code>POST /api/refresh</code> hits the local server.</li>
+        <li><code>refreshService</code> takes an in-flight lock (a second refresh gets <span class="mono">409</span>) and reads the previous snapshot.</li>
+        <li>For each <b>enabled</b> provider in order, the collector checks the CLI is installed &amp; logged in, then drives it through the PTY conversation.</li>
+        <li>Raw terminal output is cleaned (ANSI/control codes stripped, duplicate redraw lines collapsed).</li>
+        <li>A provider-specific parser regex-extracts the percentages → <code>limitFromUsed / limitFromRemaining</code> build a normalized <code>UsageLimit</code>, with a status derived from the numbers.</li>
+        <li>Results are <b>merged</b> with the previous snapshot: failed providers keep their last numbers but get flagged <span class="mono">stale</span>; healthy ones replace.</li>
+        <li>The whole snapshot is run through <b>redaction</b> (emails, org/account/session IDs) and written to <code>data/usage-snapshot.json</code>.</li>
+        <li>The redacted snapshot returns to the browser; cards re-render with freshly animated bars.</li>
+      </ol>
+    </div>
+
+    <h3 style="margin-top:22px">Status vocabulary</h3>
+    <p>Two independent signals keep the UI honest — the <i>bar</i> shows magnitude, the <i>badge</i> shows alert state.</p>
+    <div class="grid-2">
+      <div class="card">
+        <div class="chip" style="margin-bottom:10px">Limit status</div>
+        <div class="legend">
+          <span class="leg"><span class="dot" style="background:var(--st-green)"></span>available</span>
+          <span class="leg"><span class="dot" style="background:var(--st-amber)"></span>warning</span>
+          <span class="leg"><span class="dot" style="background:var(--st-red)"></span>exhausted</span>
+          <span class="leg"><span class="dot" style="background:var(--st-gray)"></span>unknown / unavailable</span>
+          <span class="leg"><span class="dot" style="background:var(--st-orange)"></span>error</span>
+          <span class="leg"><span class="dot" style="background:var(--st-purple)"></span>drift</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="chip" style="margin-bottom:10px">Bar heat (magnitude)</div>
+        <div class="legend">
+          <span class="leg"><span class="dot" style="background:var(--st-green)"></span>0–74% used</span>
+          <span class="leg"><span class="dot" style="background:var(--st-amber)"></span>75–89% used</span>
+          <span class="leg"><span class="dot" style="background:var(--st-red)"></span>90–100% used</span>
+        </div>
+        <p class="faint" style="font-size:12px; margin:12px 0 0">Bars stay graded even when data is stale, so a glance still tells you who's nearly out.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- STRUCTURE -->
+  <section id="structure">
+    <p class="eyebrow">05 — The map</p>
+    <h2>Project structure</h2>
+    <p>Clear separation of concerns: <b>collectors</b> know how to talk to a CLI, <b>parsers</b> know how to read its text, and neither knows about HTTP or React.</p>
+    <div class="tree">
+<span class="dir">src/</span>
+├─ <span class="f">main.tsx</span> <span class="c"># React entry</span>
+├─ <span class="f">App.tsx</span> <span class="c"># dashboard state, polling, refresh queue</span>
+├─ <span class="dir">components/</span>
+│   ├─ <span class="f">Header.tsx</span> <span class="c"># top bar + "Refresh all"</span>
+│   ├─ <span class="f">ProviderCard.tsx</span> <span class="c"># one provider's panel</span>
+│   └─ <span class="f">UsageRow.tsx</span> <span class="c"># a single color-graded bar</span>
+│
+├─ <span class="f">server.ts</span> <span class="c"># node:http API (127.0.0.1:4317)</span>
+├─ <span class="f">api.ts</span> <span class="c"># typed browser → server client</span>
+├─ <span class="f">refresh.ts</span> <span class="c"># orchestration + stale-merge + lock</span>
+├─ <span class="f">storage.ts</span> <span class="c"># read/write snapshot + raw, redacted</span>
+├─ <span class="f">snapshot.ts</span> <span class="c"># runtime shape validation</span>
+├─ <span class="f">config.ts</span> <span class="c"># config.json + defaults merge</span>
+├─ <span class="f">collect.ts</span> <span class="c"># CLI: `npm run collect` (headless refresh)</span>
+├─ <span class="f">types.ts</span> <span class="c"># the normalized data model</span>
+│
+├─ <span class="dir">collectors/</span> <span class="c"># HOW to drive each CLI</span>
+│   ├─ <span class="f">pty.ts</span> <span class="c"># pseudo-terminal conversation engine</span>
+│   ├─ <span class="f">command.ts</span> <span class="c"># non-interactive exec + "is installed?"</span>
+│   ├─ <span class="f">claude.ts · codex.ts · agy.ts · grok.ts</span>
+│   ├─ <span class="f">helpers.ts</span> <span class="c"># ok/failed result builders</span>
+│   └─ <span class="f">errors.ts · types.ts · index.ts</span>
+│
+├─ <span class="dir">parsers/</span> <span class="c"># text → numbers (one per provider)</span>
+│   ├─ <span class="f">common.ts</span> <span class="c"># limitFromUsed / limitFromRemaining</span>
+│   ├─ <span class="f">claude.ts · codex.ts · agy.ts · grok.ts</span>
+│   └─ <span class="f">errors.ts</span> <span class="c"># ParserDriftError</span>
+│
+└─ <span class="dir">lib/</span> <span class="c"># pure utilities</span>
+    ├─ <span class="f">terminal.ts</span> <span class="c"># ANSI / control-code cleaning</span>
+    ├─ <span class="f">percent.ts</span> <span class="c"># clamp + status-from-percent</span>
+    ├─ <span class="f">redaction.ts</span> <span class="c"># scrub emails / ids</span>
+    ├─ <span class="f">usage.ts</span> <span class="c"># labels, ordering, formatting</span>
+    └─ <span class="f">snapshotView.ts</span> <span class="c"># which providers to show</span>
+    </div>
+    <p class="faint" style="font-size:12.5px"><code>test/</code> mirrors this with 40 tests across parsers, collectors, the refresh merge logic, and snapshot visibility.</p>
+  </section>
+
+  <!-- DATA MODEL -->
+  <section id="model">
+    <p class="eyebrow">06 — The contract</p>
+    <h2>The normalized data model</h2>
+    <p>Every provider, however weird its CLI, is funneled into the same three shapes. This is what makes one dashboard possible (defined in <code>src/types.ts</code>).</p>
+    <div class="grid-3">
+      <div class="card type">
+        <div class="th">UsageSnapshot</div>
+        <div class="field"><span class="k">generatedAt</span><span class="v">string</span></div>
+        <div class="field"><span class="k">collectors</span><span class="v">CollectorHealth[]</span></div>
+        <div class="field"><span class="k">limits</span><span class="v">UsageLimit[]</span></div>
+        <p class="faint" style="font-size:12px;margin:12px 0 0">The single object the API stores &amp; serves.</p>
+      </div>
+      <div class="card type">
+        <div class="th">UsageLimit</div>
+        <div class="field"><span class="k">provider</span><span class="v">claude·codex·agy·grok</span></div>
+        <div class="field"><span class="k">scope</span><span class="v">"Current week"…</span></div>
+        <div class="field"><span class="k">usedPercent</span><span class="v">number <span class="opt">?</span></span></div>
+        <div class="field"><span class="k">remainingPercent</span><span class="v">number <span class="opt">?</span></span></div>
+        <div class="field"><span class="k">status</span><span class="v">UsageStatus</span></div>
+        <div class="field"><span class="k">resetLabel</span><span class="v">string <span class="opt">?</span></span></div>
+        <div class="field"><span class="k">informational</span><span class="v">bool <span class="opt">?</span></span></div>
+      </div>
+      <div class="card type">
+        <div class="th">CollectorHealth</div>
+        <div class="field"><span class="k">provider</span><span class="v">UsageProvider</span></div>
+        <div class="field"><span class="k">ok</span><span class="v">boolean</span></div>
+        <div class="field"><span class="k">state</span><span class="v">ok·stale·error·<br>drift·unavailable</span></div>
+        <div class="field"><span class="k">durationMs</span><span class="v">number</span></div>
+        <div class="field"><span class="k">error</span><span class="v">string <span class="opt">?</span></span></div>
+        <p class="faint" style="font-size:12px;margin:12px 0 0">Per-provider "did the fetch work?"</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- DESIGN -->
+  <section id="decisions">
+    <p class="eyebrow">07 — Why it's built this way</p>
+    <h2>Design decisions that matter</h2>
+    <div class="grid-2">
+      <div class="card"><h3>🧪 Dependency injection over mocking</h3><p style="margin:0">Collectors receive their PTY runner and command runner through a <code>CollectorContext</code>. Tests swap in fakes — no real terminals needed — which is why the tricky logic is actually tested.</p></div>
+      <div class="card"><h3>📐 Normalize early, render dumb</h3><p style="margin:0">All provider quirks are resolved in the parser layer into one <code>UsageLimit</code> shape. The React components stay simple and have no provider-specific branches.</p></div>
+      <div class="card"><h3>🛡️ Redact at the boundary</h3><p style="margin:0">Nothing reaches disk un-scrubbed. The whole snapshot and every raw dump pass through <code>redactSensitiveText</code> before being written — emails, org/account/session IDs become <span class="mono">&lt;redacted-…&gt;</span>.</p></div>
+      <div class="card"><h3>🔒 Local-only by design</h3><p style="margin:0">Both the API and Vite dev server bind to <code>127.0.0.1</code>, and <code>data/</code> is git-ignored. Your usage never leaves the machine.</p></div>
+      <div class="card"><h3>♻️ Degrade, don't disappear</h3><p style="margin:0">A failed refresh keeps the last good numbers, marks them <span class="mono">stale</span>, and still grades the bar by saved percentage — the dashboard is useful even when a CLI is down.</p></div>
+      <div class="card"><h3>🚦 One refresh at a time</h3><p style="margin:0">An in-flight lock serializes refreshes; the UI queues per-provider requests and polls until the run clears, so concurrent clicks can't stampede the CLIs.</p></div>
+    </div>
+  </section>
+
+  <!-- DEPENDENCIES -->
+  <section id="deps">
+    <p class="eyebrow">08 — What it stands on</p>
+    <h2>Dependencies &amp; tooling</h2>
+    <div class="grid-2">
+      <div class="card">
+        <h3 style="margin-bottom:12px">Runtime</h3>
+        <table>
+          <tr><th>Package</th><th>Role</th></tr>
+          <tr><td><span class="mono">react</span> / <span class="mono">react-dom</span></td><td class="role">the dashboard UI</td></tr>
+          <tr><td><span class="mono">node-pty</span></td><td class="role">spawn CLIs in a real pseudo-terminal</td></tr>
+          <tr><td><span class="mono">strip-ansi</span></td><td class="role">scrub terminal escape codes</td></tr>
+          <tr><td><span class="mono">@fontsource-variable/geist</span></td><td class="role">Geist + Geist Mono typefaces</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3 style="margin-bottom:12px">Build &amp; dev</h3>
+        <table>
+          <tr><th>Package</th><th>Role</th></tr>
+          <tr><td><span class="mono">typescript</span></td><td class="role">end-to-end types</td></tr>
+          <tr><td><span class="mono">vite</span> + <span class="mono">@vitejs/plugin-react</span></td><td class="role">dev server &amp; bundler</td></tr>
+          <tr><td><span class="mono">vitest</span></td><td class="role">unit tests (40 passing)</td></tr>
+          <tr><td><span class="mono">tsx</span></td><td class="role">run TS server/collector directly</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <h3 style="margin-top:22px">The four commands</h3>
+    <div class="grid-4">
+      <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm run dev</div><p class="faint" style="font-size:12px;margin:8px 0 0">Vite UI on :5173, proxies /api</p></div>
+      <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm run api</div><p class="faint" style="font-size:12px;margin:8px 0 0">collector API on :4317</p></div>
+      <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm run collect</div><p class="faint" style="font-size:12px;margin:8px 0 0">headless refresh → JSON</p></div>
+      <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm test</div><p class="faint" style="font-size:12px;margin:8px 0 0">run the vitest suite</p></div>
+    </div>
+  </section>
+
+  <footer>
+    AI Usage Viewer — architecture overview · generated for orientation, not as runtime docs.
+    Source of truth is the code in <code>src/</code>. · Palette &amp; type mirror the live dashboard.
+  </footer>
+
+</div>
+</body>
+</html>

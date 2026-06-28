@@ -1,0 +1,13 @@
+gpt-5.5 xhigh fast · Context 100% left · 5h 97% left · weekly 76% left
+
+/status
+
+OpenAI Codex (v0.136.0)
+Account: person@example.com (Pro)
+Session: 019e8dd1-3c9c-7563-98f3-fe56f5745d55
+
+5h limit: [####################] 97% left (resets 03:41 on 4 Jun)
+Weekly limit: [###############.....] 76% left (resets 00:23 on 8 Jun)
+GPT-5.3-Codex-Spark limit:
+5h limit: [####################] 100% left (resets 04:09 on 4 Jun)
+Weekly limit: [####################] 100% left (resets 23:09 on 10 Jun)
