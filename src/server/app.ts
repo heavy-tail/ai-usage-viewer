@@ -46,6 +46,11 @@ async function route(
   rootDir: string,
   refresh: RefreshService
 ): Promise<void> {
+  if (!isLocalRequest(req)) {
+    json(res, 403, { error: "Forbidden: request must originate from the local app." });
+    return;
+  }
+
   const method = req.method ?? "GET";
   const url = new URL(req.url ?? "/", "http://localhost");
 
@@ -98,6 +103,31 @@ async function route(
 
 function parseProvider(value: string): UsageProvider | undefined {
   return PROVIDER_ORDER.find((provider) => provider === value);
+}
+
+// Loopback binding is not a trust boundary on its own: a malicious web page can
+// still send requests to 127.0.0.1, and DNS rebinding can forge a non-loopback
+// Host. Require a loopback Host and reject any cross-origin browser request
+// before a route reads local data or triggers a refresh. Requests with no Origin
+// (the local launch-refresh script, curl, tests) are allowed.
+function isLocalRequest(req: IncomingMessage): boolean {
+  if (!isLoopbackHost(req.headers.host)) return false;
+  const origin = req.headers.origin;
+  return origin === undefined || isLoopbackOrigin(origin);
+}
+
+function isLoopbackHost(host: string | undefined): boolean {
+  if (!host) return false;
+  const name = host.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
+  return name === "127.0.0.1" || name === "localhost" || name === "::1";
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    return isLoopbackHost(new URL(origin).host);
+  } catch {
+    return false;
+  }
 }
 
 function json(res: ServerResponse, statusCode: number, body: unknown): void {

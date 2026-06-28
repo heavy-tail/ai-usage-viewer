@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { AddressInfo } from "node:net";
-import type { Server } from "node:http";
+import { request as httpRequest, type Server } from "node:http";
 import { describe, expect, it } from "vitest";
 import { createUsageServer } from "../src/server/app";
 import { RefreshInProgressError, type RefreshService } from "../src/refresh";
@@ -45,6 +45,32 @@ async function withServer(
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+}
+
+// Raw http client so tests can set Host/Origin headers that fetch() forbids.
+function rawRequest(
+  base: string,
+  path: string,
+  opts: { method?: string; headers?: Record<string, string> } = {}
+): Promise<number> {
+  const url = new URL(base + path);
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method: opts.method ?? "GET",
+        headers: opts.headers,
+      },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 describe("usage server routes", () => {
@@ -130,6 +156,42 @@ describe("usage server routes", () => {
       expect(res.status).toBe(409);
       const body = (await res.json()) as { refreshing: boolean };
       expect(body.refreshing).toBe(true);
+    });
+  });
+
+  it("rejects a non-loopback Host header (DNS-rebinding guard)", async () => {
+    const rootDir = await workspace();
+    await withServer({ rootDir, refresh: okRefresh }, async (base) => {
+      const status = await rawRequest(base, "/api/snapshot", {
+        headers: { Host: "attacker.example" },
+      });
+      expect(status).toBe(403);
+    });
+  });
+
+  it("rejects a cross-origin POST to refresh (CSRF guard)", async () => {
+    const rootDir = await workspace();
+    await withServer({ rootDir, refresh: okRefresh }, async (base) => {
+      const status = await rawRequest(base, "/api/refresh", {
+        method: "POST",
+        headers: { Origin: "http://attacker.example" },
+      });
+      expect(status).toBe(403);
+    });
+  });
+
+  it("allows requests from a loopback Origin", async () => {
+    const rootDir = await workspace();
+    await writeFile(
+      join(rootDir, "data", "usage-snapshot.json"),
+      JSON.stringify(validSnapshot),
+      "utf8"
+    );
+    await withServer({ rootDir, refresh: okRefresh }, async (base) => {
+      const status = await rawRequest(base, "/api/snapshot", {
+        headers: { Origin: "http://localhost:5173" },
+      });
+      expect(status).toBe(200);
     });
   });
 });

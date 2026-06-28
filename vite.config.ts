@@ -7,6 +7,22 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: 5173,
+    // .gitignore keeps these out of Git, but the dev server would still serve
+    // them over HTTP from the project root. Deny private config, runtime data,
+    // and VCS metadata explicitly. Setting `deny` replaces Vite's defaults, so
+    // the built-ins (.env, certs, .git) are re-included here.
+    fs: {
+      deny: [
+        ".env",
+        ".env.*",
+        "*.{crt,pem}",
+        "**/.git/**",
+        "config.json",
+        "**/data/**",
+        "*.local",
+        "DEPLOY_PLAN.md",
+      ],
+    },
     proxy: {
       "/api": "http://127.0.0.1:4317",
     },
