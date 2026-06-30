@@ -10,3 +10,6 @@ config.json
 
 # Local-only deploy notes
 DEPLOY_PLAN.md
+
+# Local AI-assistant notes — never publish
+CLAUDE.md
