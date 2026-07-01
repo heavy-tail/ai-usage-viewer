@@ -24,14 +24,17 @@ export function parseClaudeUsage(text: string, meta: ParserMeta): UsageLimit[] {
     /Current week\s*\(Sonnet only\)[\s\S]*?(\d+(?:\.\d+)?)%\s+used/i
   );
 
-  if (!session || !weekAll || !weekSonnet) {
+  // Session + all-models weekly are always present. The per-model "Sonnet only"
+  // line is optional: newer Claude Code builds dropped it, and requiring it made
+  // every refresh drift once that line disappeared. Include it only when present.
+  if (!session || !weekAll) {
     throw new ParserDriftError(
       "Claude usage output did not contain the required usage sections.",
       text
     );
   }
 
-  return [
+  const limits: UsageLimit[] = [
     limitFromUsed({
       id: "claude:session",
       provider: "claude",
@@ -54,17 +57,24 @@ export function parseClaudeUsage(text: string, meta: ParserMeta): UsageLimit[] {
       sourceText: sectionText(text, "Current week (all models)"),
       meta,
     }),
-    limitFromUsed({
-      id: "claude:week-sonnet",
-      provider: "claude",
-      providerLabel: "Claude Code",
-      scope: "Current week (Sonnet only)",
-      window: "weekly",
-      usedPercent: Number(weekSonnet[1]),
-      sourceText: sectionText(text, "Current week (Sonnet only)"),
-      meta,
-    }),
   ];
+
+  if (weekSonnet) {
+    limits.push(
+      limitFromUsed({
+        id: "claude:week-sonnet",
+        provider: "claude",
+        providerLabel: "Claude Code",
+        scope: "Current week (Sonnet only)",
+        window: "weekly",
+        usedPercent: Number(weekSonnet[1]),
+        sourceText: sectionText(text, "Current week (Sonnet only)"),
+        meta,
+      })
+    );
+  }
+
+  return limits;
 }
 
 export function parseClaudeAuthStatus(text: string): ClaudeAuthStatus {

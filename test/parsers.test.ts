@@ -40,6 +40,25 @@ describe("provider parsers", () => {
     });
   });
 
+  it("parses Claude usage when the optional Sonnet-only line is absent", () => {
+    const text = [
+      "Current session",
+      "3% used",
+      "Resets 3:10am (Asia/Seoul)",
+      "",
+      "Current week (all models)",
+      "20% used",
+      "Resets Jul 7, 4pm (Asia/Seoul)",
+      "",
+      "What's contributing to your limits usage?",
+    ].join("\n");
+    const limits = parseClaudeUsage(text, meta);
+    expect(limits).toHaveLength(2);
+    expect(pick(limits, "claude:session")).toMatchObject({ usedPercent: 3 });
+    expect(pick(limits, "claude:week-all")).toMatchObject({ usedPercent: 20 });
+    expect(limits.find((l) => l.id === "claude:week-sonnet")).toBeUndefined();
+  });
+
   it("uses configured Claude Max tier label when auth only reports max", () => {
     const auth = parseClaudeAuthStatus("loggedIn: true\nsubscriptionType: max\n");
     expect(claudePlanLabel(auth, "Max 200")).toBe("Max 200");
