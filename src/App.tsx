@@ -48,30 +48,6 @@ export function App() {
     }
   }, []);
 
-  // Load the latest stored snapshot from the local API on mount.
-  useEffect(() => {
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const first = await getSnapshot(controller.signal);
-        setSnapshot(first.snapshot);
-        setConnection("live");
-        setError(null);
-        if (first.refreshing) {
-          setRefreshing("all");
-          await pollUntilIdle(controller.signal);
-          if (!controller.signal.aborted) setRefreshing(null);
-        }
-      } catch (err) {
-        if (controller.signal.aborted) return;
-        setSnapshot(mockSnapshot);
-        setConnection("offline");
-        setError(messageOf(err));
-      }
-    })();
-    return () => controller.abort();
-  }, [pollUntilIdle]);
-
   const refreshAll = useCallback(async () => {
     setRefreshing("all");
     setQueuedProviders([]);
@@ -95,6 +71,35 @@ export function App() {
       setRefreshing(null);
     }
   }, [pollUntilIdle]);
+
+  // On open: show the last stored snapshot instantly, then auto-refresh so the
+  // numbers are current without the user clicking "Refresh all". If a refresh is
+  // already running server-side, follow that one instead of starting another.
+  useEffect(() => {
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const first = await getSnapshot(controller.signal);
+        if (controller.signal.aborted) return;
+        setSnapshot(first.snapshot);
+        setConnection("live");
+        setError(null);
+        if (first.refreshing) {
+          setRefreshing("all");
+          await pollUntilIdle(controller.signal);
+          if (!controller.signal.aborted) setRefreshing(null);
+        } else if (!controller.signal.aborted) {
+          void refreshAll();
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        setSnapshot(mockSnapshot);
+        setConnection("offline");
+        setError(messageOf(err));
+      }
+    })();
+    return () => controller.abort();
+  }, [pollUntilIdle, refreshAll]);
 
   const runProviderRefresh = useCallback(
     async (provider: UsageProvider) => {
