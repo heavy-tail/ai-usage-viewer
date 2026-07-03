@@ -1,4 +1,5 @@
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │  Build with Grok                                                                │
-│  > _                                                                            │
-╰──────────────────────────── Monthly limit left: 56% · Composer 2.5 Fast ─╯
+│  ❯ /usage show                                                                  │
+╰────────────────────────────────────────────── Composer 2.5 Fast ─╯
+Shift+Tab:mode  │  Ctrl+x:shortcuts │ 458 / 200K │ Monthly limit: 44%  Next reset: July 31, 16:00 PT

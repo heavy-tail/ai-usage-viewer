@@ -30,13 +30,17 @@ export async function collectGrok(
       command,
       args: ["--no-alt-screen"],
       cwd: context.rootDir,
-      // Native launch is fast (no WSL cold start); keep some headroom anyway.
-      totalTimeoutMs: 25_000,
-      responders: [{ when: /Resume session/i, send: "\x1b[B\r", once: true }],
+      totalTimeoutMs: 30_000,
       steps: [
-        // The footer ("Monthly limit left: N%") appears once the CLI has drawn,
-        // so wait for it directly — no menu navigation needed.
-        { waitFor: /Monthly limit left:\s*\d/i, timeoutMs: 20_000 },
+        // Grok moved quota behind `/usage show` ("View credit usage"). Wait for
+        // the composer to draw, then run it by opening the slash autocomplete
+        // ("/usage " leaves "show" highlighted) and pressing Enter. Typing "show"
+        // ourselves collides with the completion and errors ("Unknown argument").
+        { waitFor: /Composer 2\.5|❯|\d+\s*\/\s*\d+K/i, timeoutMs: 15_000 },
+        { delayMs: 3_500 },
+        { send: "/usage ", delayMs: 1_500 },
+        { send: "\r", delayMs: 300 },
+        { waitFor: /Monthly limit:\s*\d/i, timeoutMs: 12_000 },
         { delayMs: 300 },
         { send: "/quit\r", delayMs: 100 },
       ],
@@ -52,7 +56,7 @@ export async function collectGrok(
 
     const meta = {
       checkedAt,
-      sourceCommand: "grok (launch footer)",
+      sourceCommand: "grok -> /usage show",
       planLabel: context.config.planLabelFallback.grok ?? "SuperGrok",
     };
 

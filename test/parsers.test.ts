@@ -259,7 +259,7 @@ describe("provider parsers", () => {
     });
   });
 
-  it("parses Grok monthly-limit footer fixture", async () => {
+  it("parses Grok /usage show output", async () => {
     const limits = parseGrokUsage(await fixture("grok-usage.txt"), meta);
     expect(pick(limits, "grok:monthly")).toMatchObject({
       scope: "Monthly limit",
@@ -267,12 +267,13 @@ describe("provider parsers", () => {
       usedPercent: 44,
       remainingPercent: 56,
       status: "available",
+      resetLabel: "Resets July 31, 16:00 PT",
     });
   });
 
-  it("reads the Grok footer through box borders and a spinner artifact", () => {
+  it("reads Grok /usage show through status-bar artifacts", () => {
     const limits = parseGrokUsage(
-      "╰──────────────── Monthly limit left: 0% · ⠧ q ─╯",
+      "Ctrl+x:shortcutsX │ 458 / 200K │ Monthly limit: 100%XNext reset: Aug 1, 09:00 PT q",
       meta
     );
 
@@ -280,7 +281,7 @@ describe("provider parsers", () => {
       remainingPercent: 0,
       usedPercent: 100,
       status: "exhausted",
-      statusLabel: undefined,
+      resetLabel: "Resets Aug 1, 09:00 PT",
     });
   });
 
