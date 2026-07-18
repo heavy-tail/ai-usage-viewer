@@ -3,6 +3,8 @@ import { DEFAULT_CONFIG } from "../src/config";
 import { collectAgy } from "../src/collectors/agy";
 import { collectClaude } from "../src/collectors/claude";
 import { collectCodex } from "../src/collectors/codex";
+import { CodexAppServerError } from "../src/collectors/codexAppServer";
+import { collectGrok } from "../src/collectors/grok";
 import { PtyProcessError, PtyTimeoutError } from "../src/collectors/errors";
 import type { PtyRunner } from "../src/collectors/pty";
 import type { CollectorContext, CommandRunner } from "../src/collectors/types";
@@ -22,7 +24,11 @@ describe("PTY collectors with mocked process output", () => {
       throw new PtyTimeoutError("timed out", "raw timeout", "clean timeout");
     }) as unknown as PtyRunner;
 
-    const result = await collectCodex(context({ ptyRunner }));
+    const result = await collectCodex(context({ ptyRunner }), {
+      appServerReader: async () => {
+        throw new CodexAppServerError("app-server unavailable in TUI fallback test");
+      },
+    });
 
     expect(result.state).toBe("error");
     expect(result.error).toBe("timed out");
@@ -40,7 +46,11 @@ describe("PTY collectors with mocked process output", () => {
       );
     }) as unknown as PtyRunner;
 
-    const result = await collectCodex(context({ ptyRunner }));
+    const result = await collectCodex(context({ ptyRunner }), {
+      appServerReader: async () => {
+        throw new CodexAppServerError("app-server unavailable in TUI fallback test");
+      },
+    });
 
     expect(result.state).toBe("ok");
     expect(result.error).toBeUndefined();
@@ -77,6 +87,66 @@ describe("PTY collectors with mocked process output", () => {
     expect(result.state).toBe("drift");
     expect(result.error).toContain("no recognized quota groups");
     expect(result.cleanedText).toContain("Models & Quota");
+  });
+
+  it("only answers Agy's trust question, not ordinary workspace help", async () => {
+    const ptyRunner = vi.fn(async (options) => {
+      const responder = options.responders?.[0];
+      expect(responder?.when).toBeInstanceOf(RegExp);
+      const pattern = responder?.when as RegExp;
+      expect(pattern.test("Add a directory to the workspace")).toBe(false);
+      expect(pattern.test("Do you trust this workspace?")).toBe(true);
+      return {
+        rawOutput:
+          "GEMINI MODELS\nWeekly Limit\n[########] 100%\nQuota available\n" +
+          "Five Hour Limit\n[########] 100%\nQuota available",
+        cleanedOutput:
+          "GEMINI MODELS\nWeekly Limit\n[########] 100%\nQuota available\n" +
+          "Five Hour Limit\n[########] 100%\nQuota available",
+      };
+    }) as unknown as PtyRunner;
+
+    const result = await collectAgy(context({ ptyRunner }));
+
+    expect(result.state).toBe("ok");
+    expect(result.limits).toHaveLength(2);
+  });
+
+  it("recognizes Grok's current ready footer and collects both quota rows", async () => {
+    const ptyRunner = vi.fn(async (options) => {
+      expect(options.steps[0]?.waitFor).toBeInstanceOf(RegExp);
+      expect((options.steps[0]?.waitFor as RegExp).test("Weekly limit left: 17%"))
+        .toBe(true);
+      return {
+        rawOutput: "Weekly limit left: 17%\nMonthly limit: 30%",
+        cleanedOutput: "Weekly limit left: 17%\nMonthly limit: 30%",
+      };
+    }) as unknown as PtyRunner;
+
+    const result = await collectGrok(context({ ptyRunner }));
+
+    expect(result.state).toBe("ok");
+    expect(result.limits.map((limit) => limit.id)).toEqual([
+      "grok:weekly",
+      "grok:monthly",
+    ]);
+  });
+
+  it("keeps Grok's fresh weekly footer when the detail command changes", async () => {
+    const footer = "Grok 4.5 (high)\n>\n[stable] Weekly limit left: 0%";
+    const ptyRunner = vi.fn(async () => {
+      throw new PtyTimeoutError("detail timed out", footer, footer);
+    }) as unknown as PtyRunner;
+
+    const result = await collectGrok(context({ ptyRunner }));
+
+    expect(result.state).toBe("ok");
+    expect(result.limits).toHaveLength(1);
+    expect(result.limits[0]).toMatchObject({
+      id: "grok:weekly",
+      remainingPercent: 0,
+      usedPercent: 100,
+    });
   });
 });
 

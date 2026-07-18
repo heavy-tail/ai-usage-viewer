@@ -10,10 +10,11 @@ for local OAuth/subscription usage screens, not API billing or token accounting.
 
 ## Supported Providers
 
-- Claude Code: `/usage` and `claude auth status`
-- OpenAI Codex: TUI footer from `codex --no-alt-screen`
+- Claude Code: accessibility-mode `/usage` output and `claude auth status`
+- OpenAI Codex: structured `account/rateLimits/read` through app-server, with
+  the TUI footer as a fallback for older builds
 - Antigravity CLI (`agy`): `/quota`
-- Grok Build CLI (native Windows binary): quota read from the launch footer
+- Grok Build CLI (native Windows binary): weekly footer plus `/usage show`
 
 Collectors are best-effort because these CLIs expose usage through interactive
 terminal UIs. If a CLI is missing, logged out, times out, or changes output
@@ -25,7 +26,7 @@ guessing quota values.
 Requirements:
 
 - **Windows** (the collectors drive the CLIs through Windows pseudo-consoles)
-- **Node.js 18+** and npm
+- **Node.js 24 LTS** and npm
 - The provider CLIs you want to track, **installed and logged in**. You only need
   the ones you use — Claude Code, OpenAI Codex, Antigravity (`agy`), Grok Build.
   Anything missing or logged out simply shows as unavailable.
@@ -44,7 +45,18 @@ copy config.example.json config.json
 
 ## Run
 
-Start the local API:
+For normal use, build once and start the production server:
+
+```powershell
+npm run build
+npm start
+```
+
+Open `http://127.0.0.1:4317/`. One localhost process serves both the built
+dashboard and its `/api` routes, so production use does not need a Vite proxy or
+a second terminal.
+
+For UI development with Vite hot reload, start the local API:
 
 ```powershell
 npm run api
@@ -57,14 +69,7 @@ npm run dev
 ```
 
 Open the Vite URL printed by the command, usually `http://127.0.0.1:5173/`.
-The API listens on `http://127.0.0.1:4317` and is bound to localhost.
-
-> **Supported run mode:** `npm run dev` together with `npm run api` (or the
-> desktop shortcut, which starts both). `npm run build` / `npm run preview` are
-> for type-checking and bundle inspection only — the built bundle does not proxy
-> `/api`, so a static `dist/` cannot reach the collector API on its own. If a
-> hosted build is ever needed, serve `dist/` from `src/server.ts` or front both
-> with a reverse proxy.
+Vite proxies `/api` to `http://127.0.0.1:4317`; both servers bind to localhost.
 
 To collect once without opening the UI:
 
@@ -75,6 +80,25 @@ npm run collect
 This writes `data/usage-snapshot.json` and redacted raw transcripts under
 `data/raw/`.
 
+The production server also runs a quiet compatibility refresh every six hours
+(override with `COMPATIBILITY_CHECK_INTERVAL_MINUTES`). Each successful result
+must pass the normalized adapter contract before it can replace the last
+verified rows. To run that canary immediately and receive a nonzero exit code on
+drift, use:
+
+```powershell
+npm run compatibility:check
+```
+
+For provider-side changes that happen without a repository commit,
+`.github/workflows/compatibility-canary.yml` defines a separate six-hour canary
+on a dedicated, labeled self-hosted Windows runner. Once that runner is
+provisioned with non-personal provider test accounts, drift automatically opens
+or updates one GitHub issue and recovery closes it. Only the redacted report is
+uploaded; raw CLI transcripts stay off GitHub and are removed from the runner
+workspace after each job. Personal OAuth sessions should never be copied into
+GitHub-hosted CI.
+
 ## Desktop Shortcut
 
 On Windows, generate icons and install the shortcut with:
@@ -83,9 +107,13 @@ On Windows, generate icons and install the shortcut with:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-desktop-shortcut.ps1
 ```
 
-The shortcut starts the API and dashboard locally, opens an Edge/Chrome app
-window when available, and creates a startup shortcut for the local server. Logs
-go under `data/logs/`.
+The shortcut starts the single production server locally, opens an Edge/Chrome
+app window when available, and creates a startup shortcut for that server. If
+the production dashboard is missing or older than its source files, the launcher
+rebuilds it before starting. A versioned identity/fingerprint check replaces a
+verified older backend automatically, repairs missing launcher state, and never
+stops an unrelated process that happens to own the port. Logs go under
+`data/logs/`.
 
 ## Configuration
 
@@ -106,6 +134,7 @@ source files.
 Runtime data is local and ignored by git:
 
 - `data/usage-snapshot.json`
+- `data/compatibility-report.json`
 - `data/raw/*.txt`
 - `data/logs/*`
 
@@ -124,15 +153,35 @@ npm run typecheck
 npm run build
 ```
 
-Expected coverage includes parser fixtures, collector behavior, refresh locking,
-snapshot shape, and redaction.
+Expected coverage includes current and historical parser fixtures, completeness
+checks, collector behavior, refresh locking, snapshot shape, and redaction.
+
+Pull requests and pushes to `main` run an exact install, dependency audit,
+type-check, test, and production-build check on a Windows GitHub Actions runner
+with Node.js 24.
+
+After those checks pass, `main` and `v*` tag runs also upload a Windows/Node
+deployment bundle to the workflow run. A `v*` tag publishes the verified bundle
+in a GitHub Release. The bundle contains the built dashboard, local server
+source, and locked npm manifests; it still requires Windows, Node.js 24, and an
+`npm ci` after extraction. Release tags must match `package.json`, archives are
+reproducible and boot-smoke-tested, and an existing release asset is never
+silently replaced. It is not a portable installer or an automatic desktop
+updater yet. Release runs include a SHA-256 checksum and GitHub build
+provenance; verify a downloaded archive with `gh attestation verify <archive>
+--repo heavy-tail/ai-usage-viewer` before installing it.
 
 ## Known Limitations
 
-- CLI/TUI output can drift when provider CLIs update.
+- A provider can still introduce genuinely new quota semantics that require a
+  new adapter release. The app detects incomplete/unknown sections, retains the
+  last verified values, and records a redacted compatibility report instead of
+  guessing or silently dropping rows.
 - Windows only — the collectors rely on Windows pseudo-consoles.
 - Login, workspace trust, and update prompts can make provider collection
   unavailable or stale until handled locally.
-- History charts, SQLite persistence, packaged desktop apps, browser automation
-  collectors, and background refresh are intentionally out of scope for this
-  MVP.
+- History charts, SQLite persistence, packaged desktop apps, and browser
+  automation collectors are intentionally out of scope for this MVP.
+- The compatibility report is ready for a separate repair worker to consume,
+  but this repository does not yet run an autonomous code-writing agent or
+  install releases automatically.

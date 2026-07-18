@@ -1,7 +1,8 @@
 import * as nodePty from "node-pty";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { extname, isAbsolute } from "node:path";
+import { promisify } from "node:util";
 import { cleanTerminalOutput } from "../lib/terminal";
 import {
   CollectorUnavailableError,
@@ -9,6 +10,8 @@ import {
   PtyTimeoutError,
   errorMessage,
 } from "./errors";
+
+const execFileAsync = promisify(execFile);
 
 // NOTE (C5): `waitFor` is matched against the ENTIRE accumulated output buffer,
 // not just newly-arrived bytes. If a step's pattern already appeared earlier in
@@ -20,6 +23,7 @@ export type PtyStep = {
   waitFor?: RegExp | string;
   timeoutMs?: number;
   delayMs?: number;
+  optional?: boolean;
 };
 
 // NOTE (C4): a responder WITHOUT `once: true` re-fires on every data chunk for
@@ -110,6 +114,15 @@ export const runPty: PtyRunner = async (options) => {
     notify();
   });
 
+  // Teardown can be requested by both the normal completion path and the
+  // timeout/error path. Keep it single-flight so those paths can never race two
+  // taskkill/terminal.kill calls against the same ConPTY instance.
+  let teardown: Promise<void> | undefined;
+  const teardownOnce = (): Promise<void> => {
+    teardown ??= terminatePty(terminal, () => exited, waiters);
+    return teardown;
+  };
+
   let totalTimeout: ReturnType<typeof setTimeout> | undefined;
   const totalTimer = new Promise<never>((_resolve, reject) => {
     totalTimeout = setTimeout(() => {
@@ -126,36 +139,111 @@ export const runPty: PtyRunner = async (options) => {
   const conversation = (async () => {
     for (const step of options.steps) {
       if (step.waitFor) {
-        await waitForPattern(
-          () => rawOutput,
-          () => exited,
-          step.waitFor,
-          step.timeoutMs ?? options.totalTimeoutMs,
-          waiters
-        );
+        try {
+          await waitForPattern(
+            () => rawOutput,
+            () => exited,
+            step.waitFor,
+            step.timeoutMs ?? options.totalTimeoutMs,
+            waiters
+          );
+        } catch (error) {
+          if (!step.optional || !(error instanceof PtyTimeoutError)) throw error;
+        }
       }
       if (step.send) terminal.write(step.send);
       if (step.delayMs) await sleep(step.delayMs);
     }
+  })();
 
-    await Promise.race([waitForExit(() => exited, waiters, 1_000), sleep(1_000)]);
-    if (!exited) terminal.kill();
+  try {
+    // The total timeout governs only the terminal conversation. Once every
+    // requested step has completed, cleanup gets its own bounded waits below;
+    // a slow ConPTY close must not turn verified provider output into a false
+    // collection timeout.
+    await Promise.race([conversation, totalTimer]);
+    if (totalTimeout) {
+      clearTimeout(totalTimeout);
+      totalTimeout = undefined;
+    }
+
+    await waitForExit(() => exited, waiters, 1_000);
+    if (!exited) await teardownOnce();
+
     return {
       rawOutput,
       cleanedOutput: cleanTerminalOutput(rawOutput),
       exitCode,
     };
-  })();
-
-  try {
-    return await Promise.race([conversation, totalTimer]);
   } catch (error) {
-    if (!exited) terminal.kill();
+    if (totalTimeout) {
+      clearTimeout(totalTimeout);
+      totalTimeout = undefined;
+    }
+    if (!exited) await teardownOnce();
     throw error;
   } finally {
     if (totalTimeout) clearTimeout(totalTimeout);
   }
 };
+
+async function terminatePty(
+  terminal: nodePty.IPty,
+  isExited: () => boolean,
+  waiters: Set<() => void>
+): Promise<void> {
+  if (isExited()) return;
+
+  if (process.platform === "win32") {
+    let taskkillSucceeded = false;
+    try {
+      // node-pty 1.1 asks a helper process to AttachConsole while killing a
+      // ConPTY tree. In windowless hosts that helper can throw even though the
+      // process is ultimately killed, which made tests and production logs look
+      // falsely healthy. taskkill performs the same bounded tree termination
+      // without requiring the parent process to own a Windows console.
+      await execFileAsync(
+        "taskkill.exe",
+        ["/pid", String(terminal.pid), "/T", "/F"],
+        { timeout: 3_000, windowsHide: true }
+      );
+      taskkillSucceeded = true;
+    } catch {
+      // The process may already have exited between the check and taskkill.
+    }
+    // node-pty 1.1 defers its ConPTY exit event while it flushes output.
+    await waitForExit(isExited, waiters, 2_500);
+    // A zero taskkill status or node-pty's own exit event verifies that the
+    // process tree is gone. If neither happened, retain node-pty's normal
+    // process-list cleanup instead of suppressing it speculatively.
+    const treeTerminationVerified = taskkillSucceeded || isExited();
+    // Its public kill path forks a console-list probe that can race the already
+    // dead PID and print "AttachConsole failed". We already terminated the
+    // process tree, so suppress only that redundant internal probe while still
+    // calling kill to release native ConPTY pipes/handles. Without native
+    // cleanup, a completed headless canary can keep Node's event loop alive.
+    if (treeTerminationVerified) suppressNodePtyConsoleProbe(terminal);
+    try {
+      terminal.kill();
+    } catch (error) {
+      if (!treeTerminationVerified) throw error;
+    }
+    return;
+  }
+
+  terminal.kill();
+}
+
+function suppressNodePtyConsoleProbe(terminal: nodePty.IPty): void {
+  const internal = terminal as nodePty.IPty & {
+    _agent?: {
+      _getConsoleProcessList?: () => Promise<number[]>;
+    };
+  };
+  if (internal._agent?._getConsoleProcessList) {
+    internal._agent._getConsoleProcessList = async () => [];
+  }
+}
 
 function resolvePtyCommand(
   command: string,

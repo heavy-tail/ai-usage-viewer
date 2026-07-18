@@ -22,11 +22,25 @@ describe("runPty", () => {
     await expect(
       runPty({
         command: process.execPath,
-        args: ["-e", "setTimeout(() => {}, 5000)"],
+        args: ["-e", "setTimeout(() => {}, 1200)"],
         cwd: process.cwd(),
         totalTimeoutMs: 1_500,
         steps: [{ waitFor: /this-never-appears/i, timeoutMs: 1_000 }],
       })
     ).rejects.toBeInstanceOf(PtyTimeoutError);
+  }, 15_000);
+
+  it("does not apply the conversation deadline to teardown", async () => {
+    const result = await runPty({
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 200)"],
+      cwd: process.cwd(),
+      totalTimeoutMs: 100,
+      steps: [],
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({ rawOutput: expect.any(String) })
+    );
   }, 15_000);
 });

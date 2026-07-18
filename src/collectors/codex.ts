@@ -1,16 +1,29 @@
 import { cleanTerminalOutput } from "../lib/terminal";
-import { parseCodexFooter, parseCodexLoginStatus } from "../parsers/codex";
+import {
+  parseCodexAppServerRateLimits,
+  parseCodexFooter,
+  parseCodexLoginStatus,
+} from "../parsers/codex";
+import { isParserDriftError } from "../parsers/errors";
 import {
   CollectorUnavailableError,
   PtyProcessError,
   PtyTimeoutError,
 } from "./errors";
 import { isCommandAvailable } from "./command";
+import {
+  CodexAppServerError,
+  readCodexAppServerRateLimits,
+  type CodexAppServerReader,
+} from "./codexAppServer";
 import { failedResult, okResult } from "./helpers";
 import type { CollectorContext, ProviderCollectorResult } from "./types";
 
 export async function collectCodex(
-  context: CollectorContext
+  context: CollectorContext,
+  dependencies: {
+    appServerReader?: CodexAppServerReader;
+  } = {}
 ): Promise<ProviderCollectorResult> {
   const provider = "codex" as const;
   const startedAt = Date.now();
@@ -30,6 +43,33 @@ export async function collectCodex(
 
     if (!(await isCommandAvailable("codex", context.rootDir, context.commandRunner))) {
       throw new CollectorUnavailableError("Codex CLI is not installed.");
+    }
+
+    try {
+      const appServer = await (
+        dependencies.appServerReader ?? readCodexAppServerRateLimits
+      )({ cwd: context.rootDir });
+      const appServerMeta = {
+        ...meta,
+        sourceCommand: "codex app-server -> account/rateLimits/read",
+      };
+      return okResult({
+        provider,
+        startedAt,
+        checkedAt,
+        limits: parseCodexAppServerRateLimits(appServer.payload, appServerMeta),
+        rawText: appServer.rawText,
+        cleanedText: appServer.rawText,
+        rawFileName,
+      });
+    } catch (error) {
+      // A successfully read but unrecognized structured payload is authoritative:
+      // falling back could publish a smaller TUI subset and hide a new quota.
+      if (isParserDriftError(error) || !(error instanceof CodexAppServerError)) {
+        throw error;
+      }
+      // Older Codex builds, non-ChatGPT auth, unsupported methods, and startup
+      // failures fall through to the proven terminal collector below.
     }
 
     loginText = await readCodexLoginStatus(context);

@@ -18,6 +18,7 @@ export function limitFromUsed(input: {
   meta: ParserMeta;
   window?: string;
   resetLabel?: string;
+  resetAt?: string;
   statusLabel?: string;
   informational?: boolean;
 }): UsageLimit {
@@ -32,6 +33,7 @@ export function limitFromUsed(input: {
     window: input.window,
     ...percent,
     resetLabel: input.resetLabel,
+    resetAt: input.resetAt,
     status: statusFromPercent(percent, input.sourceText, input.informational),
     statusLabel: input.statusLabel,
     informational: input.informational,
@@ -51,6 +53,7 @@ export function limitFromRemaining(input: {
   meta: ParserMeta;
   window?: string;
   resetLabel?: string;
+  resetAt?: string;
   statusLabel?: string;
   informational?: boolean;
 }): UsageLimit {
@@ -65,6 +68,7 @@ export function limitFromRemaining(input: {
     window: input.window,
     ...percent,
     resetLabel: input.resetLabel,
+    resetAt: input.resetAt,
     status: statusFromPercent(percent, input.sourceText, input.informational),
     statusLabel: input.statusLabel,
     informational: input.informational,

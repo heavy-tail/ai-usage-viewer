@@ -1,0 +1,310 @@
+name: Provider Compatibility Canary
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+# Never run two PTY canaries against the same provider test profile at once.
+concurrency:
+  group: provider-compatibility-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: Check live provider compatibility
+    # SECURITY: this custom label belongs only on a dedicated Windows runner
+    # whose service-account profile is authenticated to NON-PERSONAL provider
+    # test accounts. Never attach it to a developer workstation or personal
+    # profile, and never store provider credentials in this repository.
+    runs-on: [self-hosted, Windows, X64, usage-viewer-canary]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Check out repository without persisting credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Prepare isolated canary configuration
+        shell: pwsh
+        run: |
+          # checkout cleans ignored config.json. Defaults are safe only because
+          # this runner profile contains isolated provider test accounts.
+          # A custom config must be runner-owned and outside the checkout; set
+          # USAGE_VIEWER_CANARY_CONFIG in the runner service environment.
+          if ($env:USAGE_VIEWER_CANARY_CONFIG) {
+            $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+            $source = (Resolve-Path -LiteralPath $env:USAGE_VIEWER_CANARY_CONFIG).Path
+            if ($source.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
+              throw "USAGE_VIEWER_CANARY_CONFIG must be outside the repository checkout."
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $workspace "config.json")
+          } else {
+            Write-Host "Using repository defaults with the isolated runner test profile."
+          }
+
+      - name: Clear prior canary runtime state
+        shell: pwsh
+        run: |
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          $targets = @(
+            (Join-Path $workspace ".canary-artifacts"),
+            (Join-Path $workspace "data/raw"),
+            (Join-Path $workspace "data/usage-snapshot.json"),
+            (Join-Path $workspace "data/compatibility-report.json"),
+            (Join-Path $workspace "data/refresh.lock")
+          )
+          foreach ($target in $targets) {
+            $fullPath = [IO.Path]::GetFullPath($target)
+            if (-not $fullPath.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Refusing to clean a path outside GITHUB_WORKSPACE: $fullPath"
+            }
+            Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Install exact dependencies
+        id: dependencies
+        continue-on-error: true
+        run: npm ci
+
+      - name: Run live compatibility check
+        id: canary
+        if: steps.dependencies.outcome == 'success'
+        continue-on-error: true
+        run: npm run compatibility:check
+
+      - name: Create redacted compatibility artifact
+        id: sanitize
+        if: always()
+        shell: pwsh
+        env:
+          DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
+          CANARY_OUTCOME: ${{ steps.canary.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $outputDir = Join-Path $PWD ".canary-artifacts"
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+          $sourcePath = Join-Path $PWD "data/compatibility-report.json"
+          $source = $null
+          if (Test-Path -LiteralPath $sourcePath) {
+            try {
+              $source = Get-Content -Raw -LiteralPath $sourcePath | ConvertFrom-Json
+            } catch {
+              Write-Warning "Compatibility report was not valid JSON; publishing a metadata-only failure report."
+            }
+          }
+
+          $providers = @()
+          if ($null -ne $source) {
+            $providers = @($source.providers | ForEach-Object {
+              # Explicit allow-list: collector errors and terminal output are
+              # intentionally excluded even if a future source report adds them.
+              [ordered]@{
+                provider = [string] $_.provider
+                passed = [bool] $_.passed
+                state = [string] $_.state
+                attemptState = [string] $_.attemptState
+                checkedAt = [string] $_.checkedAt
+                rowCount = [int] $_.rowCount
+                adapterVersion = [string] $_.adapterVersion
+                formatFingerprint = [string] $_.formatFingerprint
+                formatChanged = [bool] $_.formatChanged
+              }
+            })
+          }
+
+          $commandPassed =
+            $env:DEPENDENCY_OUTCOME -eq "success" -and
+            $env:CANARY_OUTCOME -eq "success"
+          $reportPassed = $null -ne $source -and [bool] $source.passed
+          $redacted = [ordered]@{
+            schemaVersion = 1
+            redacted = $true
+            generatedAt = if ($null -ne $source) { [string] $source.generatedAt } else { (Get-Date).ToUniversalTime().ToString("o") }
+            passed = $commandPassed -and $reportPassed
+            workflowRun = $env:RUN_URL
+            providers = $providers
+          }
+          $redacted | ConvertTo-Json -Depth 6 |
+            Set-Content -LiteralPath (Join-Path $outputDir "compatibility-report.json") -Encoding utf8
+          "passed=$($redacted.passed.ToString().ToLowerInvariant())" |
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: Upload redacted compatibility report only
+        id: report_upload
+        if: always() && steps.sanitize.outcome == 'success'
+        # Never broaden this path to data/**: data/raw contains PTY transcripts.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: redacted-compatibility-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .canary-artifacts/compatibility-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Open, update, or close the compatibility issue
+        id: issue_sync
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANARY_FAILED: ${{ steps.dependencies.outcome != 'success' || steps.canary.outcome != 'success' || steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success' }}
+          DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
+          CANARY_OUTCOME: ${{ steps.canary.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          function Invoke-GitHubApi {
+            param(
+              [Parameter(Mandatory)] [string] $Method,
+              [Parameter(Mandatory)] [string] $Uri,
+              [object] $Body = $null
+            )
+            $request = @{
+              Method = $Method
+              Uri = $Uri
+              Headers = $headers
+              TimeoutSec = 30
+            }
+            if ($null -ne $Body) {
+              $request.ContentType = "application/json"
+              $request.Body = $Body | ConvertTo-Json -Depth 8
+            }
+            Invoke-RestMethod @request
+          }
+
+          $repo = $env:GITHUB_REPOSITORY
+          $api = $env:GITHUB_API_URL.TrimEnd('/')
+          $label = "compatibility-canary"
+          $title = "[canary] Provider compatibility drift detected"
+          $encodedLabel = [Uri]::EscapeDataString($label)
+
+          try {
+            Invoke-GitHubApi -Method Get -Uri "$api/repos/$repo/labels/$encodedLabel" | Out-Null
+          } catch {
+            $status = if ($null -ne $_.Exception.Response) { [int] $_.Exception.Response.StatusCode } else { 0 }
+            if ($status -ne 404) { throw }
+            Invoke-GitHubApi -Method Post -Uri "$api/repos/$repo/labels" -Body @{
+              name = $label
+              color = "b60205"
+              description = "Managed alert for the isolated provider compatibility canary"
+            } | Out-Null
+          }
+
+          $issues = @(Invoke-GitHubApi -Method Get -Uri "$api/repos/$repo/issues?state=all&labels=$encodedLabel&per_page=100&sort=created&direction=desc")
+          $matches = @($issues | Where-Object {
+            $null -eq $_.pull_request -and [string] $_.title -ceq $title
+          })
+          $managedIssue = $matches | Select-Object -First 1
+
+          $providerRows = @()
+          $redactedPath = Join-Path $PWD ".canary-artifacts/compatibility-report.json"
+          if (Test-Path -LiteralPath $redactedPath) {
+            try {
+              $report = Get-Content -Raw -LiteralPath $redactedPath | ConvertFrom-Json
+              $providerRows = @($report.providers | ForEach-Object {
+                "| $($_.provider) | $($_.state) | $($_.attemptState) | $($_.rowCount) | $($_.adapterVersion) |"
+              })
+            } catch {
+              $providerRows = @()
+            }
+          }
+          if ($providerRows.Count -eq 0) {
+            $providerRows = @("| _No redacted provider results available_ | - | - | - | - |")
+          }
+
+          $result = if ($env:CANARY_FAILED -eq "true") { "FAILED" } else { "RECOVERED" }
+          $body = @"
+          <!-- usage-viewer-compatibility-canary -->
+          This issue is managed automatically by the isolated provider compatibility canary.
+
+          - **Latest result:** $result
+          - **Dependency install:** $env:DEPENDENCY_OUTCOME
+          - **Compatibility command:** $env:CANARY_OUTCOME
+          - **Commit:** ``$env:COMMIT_SHA``
+          - **Run:** [Open workflow run]($env:RUN_URL)
+
+          | Provider | State | Attempt | Rows | Adapter |
+          | --- | --- | --- | ---: | --- |
+          $($providerRows -join "`n")
+
+          The uploaded artifact is allow-list redacted. Raw PTY transcripts and provider credentials are never uploaded.
+          "@
+
+          if ($env:CANARY_FAILED -eq "true") {
+            if ($null -eq $managedIssue) {
+              $managedIssue = Invoke-GitHubApi -Method Post -Uri "$api/repos/$repo/issues" -Body @{
+                title = $title
+                body = $body
+                labels = @($label)
+              }
+            } else {
+              Invoke-GitHubApi -Method Patch -Uri "$api/repos/$repo/issues/$($managedIssue.number)" -Body @{
+                state = "open"
+                title = $title
+                body = $body
+                labels = @($label)
+              } | Out-Null
+            }
+
+            # Enforce one managed open issue even if an old run was duplicated.
+            $matches | Where-Object {
+              $_.number -ne $managedIssue.number -and $_.state -eq "open"
+            } | ForEach-Object {
+              Invoke-GitHubApi -Method Patch -Uri "$api/repos/$repo/issues/$($_.number)" -Body @{
+                state = "closed"
+                state_reason = "not_planned"
+              } | Out-Null
+            }
+          } else {
+            $matches | Where-Object { $_.state -eq "open" } | ForEach-Object {
+              Invoke-GitHubApi -Method Patch -Uri "$api/repos/$repo/issues/$($_.number)" -Body @{
+                state = "closed"
+                state_reason = "completed"
+                body = $body
+              } | Out-Null
+            }
+          }
+
+      - name: Remove workspace runtime artifacts
+        if: always()
+        shell: pwsh
+        run: |
+          # Keep the redacted report, but remove only known runtime files inside
+          # this checkout. In particular, never leave PTY transcripts behind.
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          $targets = @(
+            (Join-Path $workspace "data/raw"),
+            (Join-Path $workspace "data/usage-snapshot.json"),
+            (Join-Path $workspace "data/refresh.lock"),
+            (Join-Path $workspace "config.json")
+          )
+          foreach ($target in $targets) {
+            $fullPath = [IO.Path]::GetFullPath($target)
+            if (-not $fullPath.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Refusing to clean a path outside GITHUB_WORKSPACE: $fullPath"
+            }
+            Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Fail after recording a canary failure
+        if: always() && (steps.dependencies.outcome != 'success' || steps.canary.outcome != 'success' || steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success')
+        shell: pwsh
+        run: throw "Provider compatibility canary failed; the managed issue and redacted artifact were updated."

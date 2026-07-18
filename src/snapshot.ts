@@ -32,8 +32,17 @@ export function validateSnapshotShape(value: unknown): value is UsageSnapshot {
         PROVIDERS.includes(collector.provider) &&
         typeof collector.ok === "boolean" &&
         COLLECTOR_STATES.includes(collector.state) &&
+        validAttemptState(
+          (collector as { attemptState?: unknown }).attemptState
+        ) &&
         typeof collector.checkedAt === "string" &&
-        typeof collector.durationMs === "number"
+        typeof collector.durationMs === "number" &&
+        (collector.adapterVersion === undefined ||
+          typeof collector.adapterVersion === "string") &&
+        (collector.formatFingerprint === undefined ||
+          typeof collector.formatFingerprint === "string") &&
+        (collector.formatChanged === undefined ||
+          typeof collector.formatChanged === "boolean")
       );
     }) &&
     snapshot.limits.every((limit) => {
@@ -48,5 +57,14 @@ export function validateSnapshotShape(value: unknown): value is UsageSnapshot {
         typeof limit.checkedAt === "string"
       );
     })
+  );
+}
+
+function validAttemptState(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "string" &&
+      value !== "stale" &&
+      COLLECTOR_STATES.includes(value as CollectorState))
   );
 }

@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { parseGrokUsage } from "../parsers/grok";
-import { CollectorUnavailableError } from "./errors";
+import { CollectorUnavailableError, PtyTimeoutError } from "./errors";
 import { isCommandAvailable } from "./command";
 import { failedResult, okResult } from "./helpers";
 import type { CollectorContext, ProviderCollectorResult } from "./types";
@@ -26,25 +26,45 @@ export async function collectGrok(
       throw new CollectorUnavailableError(`Grok CLI (${command}) is not installed.`);
     }
 
-    const pty = await context.ptyRunner({
-      command,
-      args: ["--no-alt-screen"],
-      cwd: context.rootDir,
-      totalTimeoutMs: 30_000,
-      steps: [
-        // Grok moved quota behind `/usage show` ("View credit usage"). Wait for
-        // the composer to draw, then run it by opening the slash autocomplete
-        // ("/usage " leaves "show" highlighted) and pressing Enter. Typing "show"
-        // ourselves collides with the completion and errors ("Unknown argument").
-        { waitFor: /Composer 2\.5|❯|\d+\s*\/\s*\d+K/i, timeoutMs: 15_000 },
-        { delayMs: 3_500 },
-        { send: "/usage ", delayMs: 1_500 },
-        { send: "\r", delayMs: 300 },
-        { waitFor: /Monthly limit:\s*\d/i, timeoutMs: 12_000 },
-        { delayMs: 300 },
-        { send: "/quit\r", delayMs: 100 },
-      ],
-    });
+    let pty;
+    try {
+      pty = await context.ptyRunner({
+        command,
+        args: ["--no-alt-screen"],
+        cwd: context.rootDir,
+        totalTimeoutMs: 30_000,
+        steps: [
+          // Grok 0.2.67 removed the version-specific "Composer 2.5" marker.
+          // Its semantic quota footer appears only after input is ready.
+          { waitFor: /Weekly limit left:\s*\d/i, timeoutMs: 15_000 },
+          { delayMs: 500 },
+          // Open `/usage` completion and accept the highlighted `show` action.
+          { send: "/usage ", delayMs: 1_500 },
+          { send: "\r", delayMs: 300 },
+          {
+            waitFor: /(?:Monthly|Weekly) limit:\s*\d/i,
+            timeoutMs: 12_000,
+          },
+          { delayMs: 300 },
+          { send: "/quit\r", delayMs: 100 },
+        ],
+      });
+    } catch (error) {
+      // The launch footer is already a complete weekly quota surface. If a
+      // future `/usage` interaction changes, publish that verified row instead
+      // of throwing away fresh data or inventing a monthly value.
+      if (
+        error instanceof PtyTimeoutError &&
+        /Weekly limit left:\s*\d/i.test(error.cleanedText)
+      ) {
+        pty = {
+          rawOutput: error.rawText,
+          cleanedOutput: error.cleanedText,
+        };
+      } else {
+        throw error;
+      }
+    }
 
     if (/command not found|not found|No such file/i.test(pty.cleanedOutput)) {
       throw new CollectorUnavailableError(
@@ -56,7 +76,7 @@ export async function collectGrok(
 
     const meta = {
       checkedAt,
-      sourceCommand: "grok -> /usage show",
+      sourceCommand: "grok -> quota footer + /usage show",
       planLabel: context.config.planLabelFallback.grok ?? "SuperGrok",
     };
 

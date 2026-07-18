@@ -58,10 +58,9 @@ export function App() {
       setConnection("live");
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        // The API server's in-process refresh lock is held by a concurrent
-        // request (e.g. another browser tab) — wait it out. Note: `npm run
-        // collect` runs in a separate process and does NOT share this lock, so
-        // cross-process refreshes are last-writer-wins, not serialized.
+        // Another browser, the background monitor, or a command-line canary is
+        // already refreshing. Follow that run quietly and show its verified
+        // result when the shared lock clears.
         await pollUntilIdle();
       } else {
         setError(messageOf(err));

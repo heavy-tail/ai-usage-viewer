@@ -132,6 +132,19 @@ describe("provider parsers", () => {
     });
   });
 
+  it("rejects out-of-range Codex TUI percentages", () => {
+    const footer =
+      "gpt-5.5 - Context 100% left - 5h 120% left - weekly 76% left";
+    expect(() => parseCodexFooter(footer, meta)).toThrow(ParserDriftError);
+
+    const status = [
+      "gpt-5.5 - Context 100% left - 5h 97% left - weekly 76% left",
+      "Experimental limit:",
+      "5h limit: 120% left (resets 19:00 on 4 Jun)",
+    ].join("\n");
+    expect(() => parseCodexFooter(status, meta)).toThrow(ParserDriftError);
+  });
+
   it("deduplicates repeated Codex status blocks", () => {
     const limits = parseCodexFooter(
       [

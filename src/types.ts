@@ -56,8 +56,16 @@ export type CollectorHealth = {
   provider: UsageProvider;
   ok: boolean;
   state: CollectorState;
+  // The displayed rows may be stale. Preserve the latest attempt's cause for
+  // compatibility automation without exposing it in the primary UI.
+  attemptState?: Exclude<CollectorState, "stale">;
   checkedAt: string;
   durationMs: number;
+  // Compatibility diagnostics stay out of the primary UI, but make canary and
+  // repair reports traceable to an exact adapter and observed output shape.
+  adapterVersion?: string;
+  formatFingerprint?: string;
+  formatChanged?: boolean;
   error?: string;
 };
 

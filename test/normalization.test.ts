@@ -4,7 +4,11 @@ import {
   fromUsedPercent,
   statusFromPercent,
 } from "../src/lib/percent";
-import { redactSensitiveText, redactSnapshot } from "../src/lib/redaction";
+import {
+  redactSensitiveText,
+  redactSensitiveValue,
+  redactSnapshot,
+} from "../src/lib/redaction";
 import { validateSnapshotShape } from "../src/snapshot";
 import type { UsageSnapshot } from "../src/types";
 
@@ -59,6 +63,58 @@ describe("redaction", () => {
     expect(redacted.limits[0].accountLabel).toBe("<redacted-email>");
     expect(redacted.limits[0].sourceText).toContain("<redacted-org-id>");
     expect(redacted.limits[0].sourceText).not.toContain("org_123456");
+  });
+
+  it("redacts quoted JSON identifiers, reset credits, and bare account labels", () => {
+    const text = JSON.stringify(
+      {
+        orgId: "org_private123",
+        accountId: "account_private123",
+        sessionId: "019e8dd1-3c9c-7563-98f3-fe56f5745d55",
+        id: "RateLimitResetCredit_bf819d2d369c8191a3653cbd93980b24",
+      },
+      null,
+      2
+    );
+    const redacted = redactSensitiveText(`${text}\nAccount: wchun`);
+
+    expect(redacted).not.toContain("private123");
+    expect(redacted).not.toContain("bf819d2d369c");
+    expect(redacted).not.toContain("wchun");
+    expect(redacted).toContain("<redacted-reset-credit-id>");
+    expect(redacted).toContain("Account: <redacted-account-id>");
+  });
+
+  it("uses identity field names to redact organization and account labels", () => {
+    const redacted = redactSensitiveValue({
+      orgName: "Private Claude Organization",
+      organizationName: "Another Private Organization",
+      accountLabel: "privateuser",
+      providerLabel: "Claude Code",
+      organization: { name: "Nested Private Organization", role: "Owner" },
+    });
+
+    expect(redacted.orgName).toBe("<redacted-org-id>");
+    expect(redacted.organizationName).toBe("<redacted-org-id>");
+    expect(redacted.accountLabel).toBe("<redacted-account-id>");
+    expect(redacted.providerLabel).toBe("Claude Code");
+    expect(redacted.organization.name).toBe("<redacted-org-id>");
+    expect(redacted.organization.role).toBe("Owner");
+  });
+
+  it("redacts Claude organization label lines without matching ordinary prose", () => {
+    const text = [
+      "Organization: Private Claude Organization",
+      "orgName: Another Private Organization",
+      "Organization settings are available in the dashboard.",
+    ].join("\n");
+
+    const redacted = redactSensitiveText(text);
+    expect(redacted).not.toContain("Private Claude Organization");
+    expect(redacted).not.toContain("Another Private Organization");
+    expect(redacted).toContain(
+      "Organization settings are available in the dashboard."
+    );
   });
 });
 

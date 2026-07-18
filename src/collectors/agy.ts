@@ -28,7 +28,16 @@ export async function collectAgy(
       // 30s, which previously tripped the total cap and marked agy stale. Give
       // the slow-login case headroom (the success path still finishes in ~6-9s).
       totalTimeoutMs: 45_000,
-      responders: [{ when: /trust|workspace/i, send: "y\r", once: true }],
+      responders: [
+        {
+          // Keep this anchored to the actual trust question. A broad
+          // /workspace/ responder also matches the `/add-dir` help text and
+          // types "y" into the normal prompt while the quota screen closes.
+          when: /(?:do you trust|trust this (?:folder|workspace)|allow access to this workspace)/i,
+          send: "y\r",
+          once: true,
+        },
+      ],
       steps: [
         { waitFor: /\? for shortcuts|Google AI Pro|>\s*$/i, timeoutMs: 15_000 },
         { send: "/quota\r", delayMs: 250 },

@@ -19,9 +19,13 @@ import {
   rawFileNameForProvider,
   readSnapshot,
   writeRawOutput,
+  writeCompatibilityReport,
   writeSnapshot,
 } from "./storage";
 import { buildStaleStatusLabel } from "./lib/staleLabel";
+import { verifyCollectorResult } from "./compatibility";
+import { buildCompatibilityReport } from "./compatibilityReport";
+import { tryAcquireRefreshLock } from "./refreshLock";
 
 export class RefreshInProgressError extends Error {
   constructor() {
@@ -62,6 +66,19 @@ export const refreshService = createRefreshService();
 
 async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
   const rootDir = options.rootDir ?? process.cwd();
+  const releaseLock = await tryAcquireRefreshLock(rootDir);
+  if (!releaseLock) throw new RefreshInProgressError();
+  try {
+    return await runLockedRefresh(options, rootDir);
+  } finally {
+    await releaseLock();
+  }
+}
+
+async function runLockedRefresh(
+  options: RefreshOptions,
+  rootDir: string
+): Promise<UsageSnapshot> {
   const config = await loadConfig(rootDir);
   const previous = await readSnapshot(rootDir);
   const enabled = new Set(config.enabledProviders);
@@ -108,7 +125,9 @@ async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
     );
 
     if (result) {
-      collectors.push(healthFromResult(result, previousRows.length > 0));
+      collectors.push(
+        healthFromResult(result, previousRows.length > 0, previousHealth)
+      );
       limits.push(...rowsFromResult(result, previousRows));
       continue;
     }
@@ -137,11 +156,22 @@ async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
     });
   }
 
-  return writeSnapshot(rootDir, {
+  const snapshot = await writeSnapshot(rootDir, {
     generatedAt: new Date().toISOString(),
     collectors,
     limits,
   });
+  // The compatibility report is a global canary result: it is authoritative
+  // only when every enabled provider was attempted in the same run. A
+  // provider-only UI refresh still updates the snapshot, but must not replace a
+  // previously green full-run report with a mixed-generation result.
+  if (!options.provider) {
+    await writeCompatibilityReport(
+      rootDir,
+      buildCompatibilityReport(snapshot, config.enabledProviders)
+    );
+  }
+  return snapshot;
 }
 
 async function runProviderCollector(
@@ -150,9 +180,23 @@ async function runProviderCollector(
   context: CollectorContext
 ): Promise<ProviderCollectorResult> {
   try {
-    return await collector(context);
+    const result = await collector(context);
+    if (result.provider !== provider) {
+      return verifyCollectorResult({
+        ...result,
+        provider,
+        ok: false,
+        state: "drift",
+        limits: [],
+        rawFileName: rawFileNameForProvider(provider),
+        error: `Adapter contract rejected the refresh: collector routed for ${JSON.stringify(
+          provider
+        )} returned provider ${JSON.stringify(result.provider)}`,
+      });
+    }
+    return verifyCollectorResult(result);
   } catch (error) {
-    return {
+    return verifyCollectorResult({
       provider,
       ok: false,
       state: "error",
@@ -163,7 +207,7 @@ async function runProviderCollector(
       cleanedText: "",
       rawFileName: rawFileNameForProvider(provider),
       error: error instanceof Error ? error.message : String(error),
-    };
+    });
   }
 }
 
@@ -185,7 +229,8 @@ function disabledResult(provider: UsageProvider): ProviderCollectorResult {
 
 function healthFromResult(
   result: ProviderCollectorResult,
-  hasPreviousRows: boolean
+  hasPreviousRows: boolean,
+  previous?: CollectorHealth
 ): CollectorHealth {
   const state: CollectorState =
     result.ok || !hasPreviousRows ? result.state : "stale";
@@ -193,8 +238,15 @@ function healthFromResult(
     provider: result.provider,
     ok: result.ok,
     state,
+    attemptState: result.state,
     checkedAt: result.checkedAt,
     durationMs: result.durationMs,
+    adapterVersion: result.adapterVersion,
+    formatFingerprint: result.formatFingerprint,
+    formatChanged:
+      previous?.formatFingerprint !== undefined &&
+      result.formatFingerprint !== undefined &&
+      previous.formatFingerprint !== result.formatFingerprint,
     error:
       state === "stale" && result.error
         ? `Last refresh ${result.state}: ${result.error}`

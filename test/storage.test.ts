@@ -1,8 +1,13 @@
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { readSnapshot, writeSnapshot } from "../src/storage";
+import {
+  readSnapshot,
+  writeCompatibilityReport,
+  writeSnapshot,
+} from "../src/storage";
+import type { CompatibilityReport } from "../src/compatibilityReport";
 import type { UsageSnapshot } from "../src/types";
 
 const sample: UsageSnapshot = {
@@ -78,5 +83,61 @@ describe("storage.writeSnapshot (atomic write)", () => {
     );
 
     expect(await readSnapshot(rootDir)).toBeNull();
+  });
+
+  it("returns null when stored JSON has an invalid snapshot shape", async () => {
+    const rootDir = await workspace();
+    await mkdir(join(rootDir, "data"), { recursive: true });
+    await writeFile(
+      join(rootDir, "data", "usage-snapshot.json"),
+      JSON.stringify({ generatedAt: "2026-07-18T00:00:00.000Z" }),
+      "utf8"
+    );
+
+    expect(await readSnapshot(rootDir)).toBeNull();
+  });
+});
+
+describe("storage.writeCompatibilityReport", () => {
+  it("redacts identity values before serialization and keeps JSON parseable", async () => {
+    const rootDir = await workspace();
+    const report: CompatibilityReport & {
+      diagnostics: { orgName: string; accountLabel: string };
+    } = {
+      schemaVersion: 1,
+      generatedAt: "2026-06-27T00:00:00.000Z",
+      passed: false,
+      providers: [
+        {
+          provider: "claude",
+          passed: false,
+          state: "error",
+          attemptState: "error",
+          checkedAt: "2026-06-27T00:00:00.000Z",
+          rowCount: 0,
+          error: "Account: privateuser",
+        },
+      ],
+      diagnostics: {
+        orgName: "Private Claude Organization",
+        accountLabel: "privateuser",
+      },
+    };
+
+    await writeCompatibilityReport(rootDir, report);
+
+    const text = await readFile(
+      join(rootDir, "data", "compatibility-report.json"),
+      "utf8"
+    );
+    const stored = JSON.parse(text) as typeof report;
+
+    expect(stored.providers[0].error).toBe(
+      "Account: <redacted-account-id>"
+    );
+    expect(stored.diagnostics.orgName).toBe("<redacted-org-id>");
+    expect(stored.diagnostics.accountLabel).toBe("<redacted-account-id>");
+    expect(text).not.toContain("privateuser");
+    expect(text).not.toContain("Private Claude Organization");
   });
 });

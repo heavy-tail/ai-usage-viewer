@@ -29,8 +29,13 @@ export function buildStaleStatusLabel(previousLabel?: string): string {
 // What to render for a row's statusLabel in the UI.
 export function displayStatusLabel(statusLabel?: string): string | undefined {
   if (!statusLabel) return undefined;
+  const stale = /^stale\b/i.test(statusLabel);
   const detail = stripStalePrefix(statusLabel);
-  if (!detail || /^stale$/i.test(detail)) return "stale";
-  if (!/^pay-as-you-go\b/i.test(detail)) return statusLabel;
-  return /^stale\b/i.test(statusLabel) ? "stale" : undefined;
+  if (!detail || /^stale$/i.test(detail)) return undefined;
+  if (/^pay-as-you-go\b/i.test(detail)) return undefined;
+  // Staleness remains available in collector diagnostics and the private
+  // compatibility report. The primary dashboard quietly shows the last
+  // verified value and any meaningful provider detail, without asking the user
+  // to become the fixer.
+  return stale ? detail : statusLabel;
 }
