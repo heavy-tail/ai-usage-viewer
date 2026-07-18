@@ -29,8 +29,8 @@ export type UsageLimit = {
   remainingPercent?: number;
   resetLabel?: string;
 
-  // MVP displays resetLabel only; resetAt stays unset until timezone/year
-  // inference is implemented (Appendix A.2.3).
+  // Canonical timestamp when the provider supplies one. The UI can safely
+  // infer older, unambiguous resetLabel shapes for consistent presentation.
   resetAt?: string;
 
   status: UsageStatus;

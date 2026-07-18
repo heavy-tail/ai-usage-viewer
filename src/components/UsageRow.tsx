@@ -1,4 +1,5 @@
 import type { UsageLimit } from "../types";
+import { displayResetLabel } from "../lib/resetTime";
 import { STATUS_TONE, fmtPercent, usageTone } from "../lib/usage";
 import { displayStatusLabel } from "../lib/staleLabel";
 
@@ -8,6 +9,7 @@ export function UsageRow({ limit }: { limit: UsageLimit }) {
   const remaining = limit.remainingPercent;
   const width = Math.max(0, Math.min(100, used ?? 0));
   const statusLabel = displayStatusLabel(limit.statusLabel);
+  const resetLabel = displayResetLabel(limit);
 
   if (limit.informational) {
     return (
@@ -35,7 +37,11 @@ export function UsageRow({ limit }: { limit: UsageLimit }) {
           {statusLabel && (
             <span className="row-statuslabel">{statusLabel}</span>
           )}
-          {limit.resetLabel && <span className="row-reset">{limit.resetLabel}</span>}
+          {resetLabel && (
+            <span className="row-reset" title={limit.resetLabel}>
+              {resetLabel}
+            </span>
+          )}
         </span>
       </div>
     </div>
