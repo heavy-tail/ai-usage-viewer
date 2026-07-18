@@ -89,8 +89,9 @@ describe("PTY collectors with mocked process output", () => {
     expect(result.cleanedText).toContain("Models & Quota");
   });
 
-  it("only answers Agy's trust question, not ordinary workspace help", async () => {
+  it("uses WinPTY and only answers Agy's trust question", async () => {
     const ptyRunner = vi.fn(async (options) => {
+      expect(options.windowsPtyBackend).toBe("winpty");
       const responder = options.responders?.[0];
       expect(responder?.when).toBeInstanceOf(RegExp);
       const pattern = responder?.when as RegExp;
@@ -114,6 +115,7 @@ describe("PTY collectors with mocked process output", () => {
 
   it("recognizes Grok's current ready footer and collects both quota rows", async () => {
     const ptyRunner = vi.fn(async (options) => {
+      expect(options.windowsPtyBackend).toBeUndefined();
       expect(options.steps[0]?.waitFor).toBeInstanceOf(RegExp);
       expect((options.steps[0]?.waitFor as RegExp).test("Weekly limit left: 17%"))
         .toBe(true);

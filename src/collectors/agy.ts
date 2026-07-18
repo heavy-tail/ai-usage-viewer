@@ -23,6 +23,11 @@ export async function collectAgy(
       cwd: context.rootDir,
       cols: 160,
       rows: 60,
+      // AGY's native console executable can briefly surface a window under the
+      // system ConPTY host. WinPTY starts its agent hidden and gives AGY the
+      // real terminal that its interactive `/quota` screen still requires.
+      // Keep this provider-specific: every other collector stays on ConPTY.
+      windowsPtyBackend: "winpty",
       // agy signs in over the network at launch ("Signing in…") before it can
       // draw the quota screen; that step is variable and occasionally exceeds
       // 30s, which previously tripped the total cap and marked agy stale. Give
