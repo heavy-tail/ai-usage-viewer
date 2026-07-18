@@ -23,7 +23,6 @@ describe("Claude collector compatibility", () => {
       expect.objectContaining({ args: ["--ax-screen-reader"] })
     );
     const options = vi.mocked(ptyRunner).mock.calls[0][0];
-    expect(options.windowsPtyBackend).toBeUndefined();
     expect(options.totalTimeoutMs).toBeGreaterThanOrEqual(45_000);
     expect(options.steps).toEqual(
       expect.arrayContaining([

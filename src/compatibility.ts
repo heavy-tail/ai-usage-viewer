@@ -8,7 +8,7 @@ import type { ProviderCollectorResult } from "./collectors/types";
 export const ADAPTER_VERSIONS: Record<UsageProvider, string> = {
   claude: "2.1.0",
   codex: "2.1.0",
-  agy: "1.1.0",
+  agy: "2.0.0",
   grok: "2.0.0",
 };
 

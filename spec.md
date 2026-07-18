@@ -116,12 +116,17 @@ Fallback implementation note:
 
 Source:
 
-```bash
-agy
-/quota
+```text
+start agy headlessly with a private temporary log
+discover its loopback HTTP port
+POST /exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary
 ```
 
-Confirmed output includes model quota rows:
+The structured response contains model groups and quota buckets with
+`window`, `remainingFraction`, and `resetTime`. The dashboard must not open or
+scrape the interactive `/quota` screen during background collection.
+
+Legacy confirmed `/quota` output includes model quota rows:
 
 ```text
 Model Quota
@@ -511,29 +516,25 @@ secondary metadata instead of a quota warning source.
 Flow:
 
 ```text
-spawn agy
-if workspace trust prompt appears, select "Yes"
-wait for prompt
-send "/quota\r"
-wait for "Model Quota"
-page down until no new model rows appear
-send escape
-send "/exit\r"
-parse output
+resolve agy once to a trusted absolute executable path
+spawn it through a hidden kill-on-close Windows Job Object host
+give agy immediate stdin EOF so invisible prompts fail closed
+read only the exact loopback HTTP port emitted by that process
+request RetrieveUserQuotaSummary with a bounded Connect JSON request
+close the host lease so Windows terminates the complete process tree
+delete the permission-restricted, size-capped temporary log
+validate and normalize grouped quota buckets
 ```
 
 Parser approach:
 
-- Use a 3-line heuristic instead of a broad model-name regex.
-- A row starts with a plausible model name line.
-- The next non-empty line with a trailing percent is the quota line.
-- The next non-empty line is the status label, for example `Quota available`.
-- Continue paging until the cleaned panel frame repeats or no new model names
-  are found after a page-down.
-- If the model/bar/status sequence is broken, mark the collector as `drift`.
-
-Known model-name prefixes include `Gemini`, `Claude`, `GPT`, and `GPT-OSS`, but
-the parser should not use a catch-all prefix that matches arbitrary UI text.
+- Require grouped buckets with a finite `remainingFraction` from 0 through 1.
+- Preserve `weekly` and `5h` windows and exact RFC 3339 reset times.
+- Apply `agy.pinnedGroups` after validating the complete response.
+- Reject unsupported quota-bearing shapes as `drift`; never fall back to the
+  interactive terminal on Windows because that can reintroduce a visible flash.
+- Persist only a canonical privacy-filtered quota shape, not the complete local
+  service response or temporary AGY log.
 
 Output rows:
 
@@ -541,12 +542,12 @@ Output rows:
 {
   provider: "agy",
   providerLabel: "Antigravity",
-  planLabel: sourcePlanLabel ?? config.planLabelFallback.agy,
-  scope: modelName,
-  window: "model-quota",
-  remainingPercent: percent,
-  usedPercent: 100 - percent,
-  statusLabel: statusLine
+  planLabel: config.planLabelFallback.agy,
+  scope: group.displayName,
+  window: bucket.window,
+  remainingPercent: bucket.remainingFraction * 100,
+  usedPercent: 100 - remainingPercent,
+  resetAt: bucket.resetTime
 }
 ```
 

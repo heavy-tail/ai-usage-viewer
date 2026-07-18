@@ -48,3 +48,23 @@ export async function isCommandAvailable(
   });
   return result.exitCode === 0 && result.stdout.trim().length > 0;
 }
+
+/** Resolve a command once so a later spawn cannot select a different PATH entry. */
+export async function resolveCommandPath(
+  command: string,
+  cwd: string,
+  runner: CommandRunner
+): Promise<string | undefined> {
+  const result =
+    process.platform === "win32"
+      ? await runner("where.exe", [command], { cwd, timeoutMs: 3_000 })
+      : await runner("sh", ["-lc", `command -v ${shQuote(command)}`], {
+          cwd,
+          timeoutMs: 3_000,
+        });
+  if (result.exitCode !== 0) return undefined;
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+}

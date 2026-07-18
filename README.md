@@ -4,8 +4,9 @@ Local dashboard for subscription quota and usage surfaced by AI CLI tools. It is
 for local OAuth/subscription usage screens, not API billing or token accounting.
 
 > **Shared as-is.** This is a personal tool published without warranty or
-> support. It reads usage by parsing each CLI's on-screen output, so a provider
-> changing its CLI can temporarily break a collector until its parser is updated.
+> support. It uses provider-local structured interfaces where available and
+> parses CLI output for the remaining providers, so a provider change can
+> temporarily break a collector until its adapter is updated.
 > Windows only.
 
 ## Supported Providers
@@ -13,22 +14,26 @@ for local OAuth/subscription usage screens, not API billing or token accounting.
 - Claude Code: accessibility-mode `/usage` output and `claude auth status`
 - OpenAI Codex: structured `account/rateLimits/read` through app-server, with
   the TUI footer as a fallback for older builds
-- Antigravity CLI (`agy`): `/quota`
+- Antigravity CLI (`agy`): structured quota from its headless local service
 - Grok Build CLI (native Windows binary): weekly footer plus `/usage show`
 
-Collectors are best-effort because these CLIs expose usage through interactive
-terminal UIs. If a CLI is missing, logged out, times out, or changes output
-format, the app records `unavailable`, `error`, `stale`, or `drift` instead of
-guessing quota values.
+Collectors are best-effort because these are local provider interfaces rather
+than public billing APIs. If a CLI is missing, logged out, times out, or changes
+its response format, the app records `unavailable`, `error`, `stale`, or `drift`
+instead of guessing quota values.
 
 ## Install
 
 Requirements:
 
-- **Windows** (the collectors drive the CLIs through Windows pseudo-consoles)
+- **Windows** (some collectors drive interactive CLIs through pseudo-consoles)
 - **Node.js 24 LTS** and npm
 - The provider CLIs you want to track, **installed and logged in**. You only need
   the ones you use — Claude Code, OpenAI Codex, Antigravity (`agy`), Grok Build.
+
+The first test, build, or start compiles a small local AGY process-containment
+helper with Windows' built-in .NET Framework compiler. The generated executable
+stays under ignored `.runtime/` state and is not published from the repository.
   Anything missing or logged out simply shows as unavailable.
 
 ```powershell
@@ -77,8 +82,8 @@ To collect once without opening the UI:
 npm run collect
 ```
 
-This writes `data/usage-snapshot.json` and redacted raw transcripts under
-`data/raw/`.
+This writes `data/usage-snapshot.json` and privacy-filtered diagnostic output
+under `data/raw/`.
 
 The production server also runs a quiet compatibility refresh every six hours
 (override with `COMPATIBILITY_CHECK_INTERVAL_MINUTES`). Each successful result

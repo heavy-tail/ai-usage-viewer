@@ -46,8 +46,6 @@ export type RunPtyOptions = {
   steps: PtyStep[];
   totalTimeoutMs: number;
   responders?: PtyResponder[];
-  /** Select a Windows PTY backend. Defaults to the system ConPTY host. */
-  windowsPtyBackend?: "system-conpty" | "winpty";
 };
 
 export type PtyRunResult = {
@@ -76,18 +74,17 @@ export const runPty: PtyRunner = async (options) => {
       rows: options.rows ?? 40,
       cwd: options.cwd,
       env: { ...process.env, ...options.env },
-      // Windows: default to the system ConPTY backend. AGY alone opts into
-      // WinPTY because its native console executable can surface a transient
-      // window under ConPTY; WinPTY creates its console agent with SW_HIDE and
-      // still provides the real terminal required by AGY's `/quota` screen.
-      // Keep that opt-in provider-specific: ConPTY's redraw stream is more
-      // complete for Claude and the other interactive providers.
+      // Windows: use ConPTY (the modern pseudo-console) instead of winpty.
+      // winpty spawns a `winpty-agent` helper that creates a classic console
+      // window before hiding it, which can produce a one-frame flash. ConPTY
+      // emits slightly different redraw/escape sequences, so
+      // `cleanTerminalOutput` and the per-provider parsers are verified against
+      // it.
       //
-      // The setting is omitted entirely off Windows so it cannot affect Unix
-      // PTY behavior.
-      ...(process.platform === "win32"
-        ? { useConpty: options.windowsPtyBackend !== "winpty" }
-        : {}),
+      // NOTE: we intentionally do NOT set `useConptyDll` — node-pty's bundled
+      // conpty.dll conout path truncated Claude's `/usage` redraw enough to
+      // break its parser. The default ConPTY path keeps Claude + Codex intact.
+      ...(process.platform === "win32" ? { useConpty: true } : {}),
     });
   } catch (error) {
     throw new CollectorUnavailableError(errorMessage(error));
@@ -121,21 +118,9 @@ export const runPty: PtyRunner = async (options) => {
   // Teardown can be requested by both the normal completion path and the
   // timeout/error path. Keep it single-flight so those paths can never race two
   // taskkill/terminal.kill calls against the same ConPTY instance.
-  let winPtyAgentReleased = false;
-  const releaseWinPtyAgentOnce = () => {
-    if (winPtyAgentReleased) return;
-    winPtyAgentReleased = true;
-    killNodePtyWinPtyAgent(terminal);
-  };
   let teardown: Promise<void> | undefined;
   const teardownOnce = (): Promise<void> => {
-    teardown ??= terminatePty(
-      terminal,
-      () => exited,
-      waiters,
-      options.windowsPtyBackend,
-      releaseWinPtyAgentOnce
-    );
+    teardown ??= terminatePty(terminal, () => exited, waiters);
     return teardown;
   };
 
@@ -200,54 +185,17 @@ export const runPty: PtyRunner = async (options) => {
     throw error;
   } finally {
     if (totalTimeout) clearTimeout(totalTimeout);
-    if (process.platform === "win32" && options.windowsPtyBackend === "winpty") {
-      try {
-        // node-pty 1.1 also retains WinPTY's native process/PTY handles after a
-        // normal child exit. Release its agent on every completion path.
-        releaseWinPtyAgentOnce();
-      } finally {
-        // It likewise never disposes the output worker or JavaScript pipe
-        // sockets in the WinPTY branch. Release all three after output is done.
-        disposeNodePtyWinPtyResources(terminal);
-      }
-    }
   }
 };
 
 async function terminatePty(
   terminal: nodePty.IPty,
   isExited: () => boolean,
-  waiters: Set<() => void>,
-  windowsPtyBackend?: RunPtyOptions["windowsPtyBackend"],
-  releaseWinPtyAgent?: () => void
+  waiters: Set<() => void>
 ): Promise<void> {
   if (isExited()) return;
 
   if (process.platform === "win32") {
-    if (windowsPtyBackend === "winpty") {
-      // WindowsTerminal.kill() is deferred until the first output chunk. A
-      // hung AGY process may never produce one, so terminate through the
-      // already-created WinPTY agent instead; it can act before readiness.
-      // Keep the output worker alive long enough to finish its pending pipe
-      // connection; the run-level finally block disposes it on every path.
-      const pipeReady = await waitForNodePtyWinPtyPipe(terminal, 2_500);
-      if (!pipeReady) {
-        // If node-pty's worker cannot finish opening the output pipe, stop it
-        // before closing WinPTY's native pipe. This prevents a late ENOENT
-        // connection from becoming an uncaught process-level error.
-        disposeNodePtyWinPtyResources(terminal);
-        await sleep(1_100);
-      }
-      if (!releaseWinPtyAgent) {
-        throw new CollectorUnavailableError(
-          "WinPTY agent cleanup was not configured."
-        );
-      }
-      releaseWinPtyAgent();
-      await waitForExit(isExited, waiters, 2_500);
-      return;
-    }
-
     let taskkillSucceeded = false;
     try {
       // node-pty 1.1 asks a helper process to AttachConsole while killing a
@@ -285,74 +233,6 @@ async function terminatePty(
   }
 
   terminal.kill();
-}
-
-type NodePtyWinPtyInternals = nodePty.IPty & {
-  _agent?: {
-    kill?: () => void;
-    _outSocket?: {
-      destroy?: () => void;
-      pending?: boolean;
-      readyState?: string;
-      once?: (event: string, listener: (...args: unknown[]) => void) => void;
-      removeListener?: (
-        event: string,
-        listener: (...args: unknown[]) => void
-      ) => void;
-    };
-    _inSocket?: { destroy?: () => void };
-    _conoutSocketWorker?: { dispose?: () => void };
-  };
-};
-
-async function waitForNodePtyWinPtyPipe(
-  terminal: nodePty.IPty,
-  timeoutMs: number
-): Promise<boolean> {
-  const socket = (terminal as NodePtyWinPtyInternals)._agent?._outSocket;
-  if (!socket?.once || !socket.removeListener) {
-    throw new CollectorUnavailableError(
-      "Unsupported node-pty WinPTY internals: output pipe state is unavailable."
-    );
-  }
-  if (socket.pending === false && socket.readyState === "open") return true;
-
-  return await new Promise<boolean>((resolve) => {
-    const onConnect = () => finish(true);
-    const onError = () => finish(false);
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    const finish = (ready: boolean) => {
-      clearTimeout(timer);
-      socket.removeListener?.("connect", onConnect);
-      socket.removeListener?.("error", onError);
-      resolve(ready);
-    };
-    socket.once?.("connect", onConnect);
-    socket.once?.("error", onError);
-  });
-}
-
-function killNodePtyWinPtyAgent(terminal: nodePty.IPty): void {
-  const kill = (terminal as NodePtyWinPtyInternals)._agent?.kill;
-  if (!kill) {
-    throw new CollectorUnavailableError(
-      "Unsupported node-pty WinPTY internals: agent cleanup is unavailable."
-    );
-  }
-  kill.call((terminal as NodePtyWinPtyInternals)._agent);
-}
-
-function disposeNodePtyWinPtyResources(terminal: nodePty.IPty): void {
-  const agent = (terminal as NodePtyWinPtyInternals)._agent;
-  const worker = agent?._conoutSocketWorker;
-  if (!worker?.dispose) {
-    throw new CollectorUnavailableError(
-      "Unsupported node-pty WinPTY internals: output worker cleanup is unavailable."
-    );
-  }
-  worker.dispose();
-  agent?._inSocket?.destroy?.();
-  agent?._outSocket?.destroy?.();
 }
 
 function suppressNodePtyConsoleProbe(terminal: nodePty.IPty): void {

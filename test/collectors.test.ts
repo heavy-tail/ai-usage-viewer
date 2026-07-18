@@ -1,15 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../src/config";
 import { collectAgy } from "../src/collectors/agy";
+import { AgyRpcError } from "../src/collectors/agyRpc";
 import { collectClaude } from "../src/collectors/claude";
 import { collectCodex } from "../src/collectors/codex";
 import { CodexAppServerError } from "../src/collectors/codexAppServer";
 import { collectGrok } from "../src/collectors/grok";
-import { PtyProcessError, PtyTimeoutError } from "../src/collectors/errors";
+import { PtyTimeoutError } from "../src/collectors/errors";
 import type { PtyRunner } from "../src/collectors/pty";
 import type { CollectorContext, CommandRunner } from "../src/collectors/types";
 
-describe("PTY collectors with mocked process output", () => {
+describe("Collectors with mocked provider output", () => {
   it("returns unavailable when a CLI is missing", async () => {
     const ptyRunner = vi.fn() as unknown as PtyRunner;
     const result = await collectClaude(context({ available: false, ptyRunner }));
@@ -64,58 +65,61 @@ describe("PTY collectors with mocked process output", () => {
     });
   });
 
-  it("maps PTY process failure to collector error", async () => {
-    const ptyRunner = vi.fn(async () => {
-      throw new PtyProcessError("exited early", "raw error", "clean error");
-    }) as unknown as PtyRunner;
-
-    const result = await collectAgy(context({ ptyRunner }));
+  it("maps AGY local service failure to collector error", async () => {
+    const ptyRunner = vi.fn() as unknown as PtyRunner;
+    const result = await collectAgy(context({ ptyRunner }), {
+      rpcReader: async () => {
+        throw new AgyRpcError("exited early", "process");
+      },
+    });
 
     expect(result.state).toBe("error");
     expect(result.error).toBe("exited early");
-    expect(result.rawText).toBe("raw error");
+    expect(result.rawText).toBe("");
+    expect(ptyRunner).not.toHaveBeenCalled();
   });
 
   it("maps parser drift to drift state", async () => {
-    const ptyRunner = vi.fn(async () => ({
-      rawOutput: "Models & Quota\nNo known model groups",
-      cleanedOutput: "Models & Quota\nNo known model groups",
-    })) as unknown as PtyRunner;
-
-    const result = await collectAgy(context({ ptyRunner }));
+    const ptyRunner = vi.fn() as unknown as PtyRunner;
+    const result = await collectAgy(context({ ptyRunner }), {
+      rpcReader: async () => ({
+        payload: { response: { groups: [] } },
+      }),
+    });
 
     expect(result.state).toBe("drift");
-    expect(result.error).toContain("no recognized quota groups");
-    expect(result.cleanedText).toContain("Models & Quota");
+    expect(result.error).toContain("no quota groups");
+    expect(result.cleanedText).toContain("redacted");
   });
 
-  it("uses WinPTY and only answers Agy's trust question", async () => {
-    const ptyRunner = vi.fn(async (options) => {
-      expect(options.windowsPtyBackend).toBe("winpty");
-      const responder = options.responders?.[0];
-      expect(responder?.when).toBeInstanceOf(RegExp);
-      const pattern = responder?.when as RegExp;
-      expect(pattern.test("Add a directory to the workspace")).toBe(false);
-      expect(pattern.test("Do you trust this workspace?")).toBe(true);
-      return {
-        rawOutput:
-          "GEMINI MODELS\nWeekly Limit\n[########] 100%\nQuota available\n" +
-          "Five Hour Limit\n[########] 100%\nQuota available",
-        cleanedOutput:
-          "GEMINI MODELS\nWeekly Limit\n[########] 100%\nQuota available\n" +
-          "Five Hour Limit\n[########] 100%\nQuota available",
-      };
-    }) as unknown as PtyRunner;
-
-    const result = await collectAgy(context({ ptyRunner }));
+  it("collects AGY's structured quota without starting a PTY", async () => {
+    const ptyRunner = vi.fn() as unknown as PtyRunner;
+    const result = await collectAgy(context({ ptyRunner }), {
+      rpcReader: async () => ({
+        payload: {
+          response: {
+            groups: [
+              {
+                displayName: "Gemini Models",
+                buckets: [
+                  { window: "weekly", remainingFraction: 1 },
+                  { window: "5h", remainingFraction: 0.8 },
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    });
 
     expect(result.state).toBe("ok");
     expect(result.limits).toHaveLength(2);
+    expect(result.cleanedText).toContain("agy local quota API");
+    expect(ptyRunner).not.toHaveBeenCalled();
   });
 
   it("recognizes Grok's current ready footer and collects both quota rows", async () => {
     const ptyRunner = vi.fn(async (options) => {
-      expect(options.windowsPtyBackend).toBeUndefined();
       expect(options.steps[0]?.waitFor).toBeInstanceOf(RegExp);
       expect((options.steps[0]?.waitFor as RegExp).test("Weekly limit left: 17%"))
         .toBe(true);
@@ -168,7 +172,7 @@ function commandRunner(available: boolean): CommandRunner {
   return async (command, args) => {
     if (command === "where.exe") {
       return {
-        stdout: available ? `${args[0]}.cmd\n` : "",
+        stdout: available ? `C:\\Tools\\${args[0]}.exe\n` : "",
         stderr: "",
         exitCode: available ? 0 : 1,
       };

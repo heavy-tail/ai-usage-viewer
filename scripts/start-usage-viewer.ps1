@@ -78,6 +78,8 @@ function Get-BackendFingerprint {
   $files = @(
     Get-ChildItem (Join-Path $RootDir "src") -Recurse -File |
       Where-Object { $_.Extension -in @(".ts", ".tsx") }
+    Get-Item (Join-Path $RootDir "scripts/AgyJobHost.cs")
+    Get-Item (Join-Path $RootDir "scripts/build-agy-job-host.ps1")
     Get-Item (Join-Path $RootDir "package.json")
     Get-Item (Join-Path $RootDir "package-lock.json")
     Get-Item (Join-Path $RootDir "tsconfig.json")
@@ -587,14 +589,29 @@ function Wait-ForSpawnedServer {
 
 function Ensure-ProductionBuild {
   $indexPath = Join-Path $RootDir "dist/index.html"
-  $buildRequired = -not (Test-Path $indexPath)
+  $jobHostPath = Join-Path $RootDir ".runtime/agy-job-host.exe"
+  $jobHostStampPath = Join-Path $RootDir ".runtime/agy-job-host.source.sha256"
+  $buildRequired =
+    -not (Test-Path $indexPath) -or
+    -not (Test-Path $jobHostPath) -or
+    -not (Test-Path $jobHostStampPath)
   if (-not $buildRequired) {
-    $builtAt = (Get-Item $indexPath).LastWriteTimeUtc
-    $inputs = @(
+    $dashboardBuiltAt = (Get-Item $indexPath).LastWriteTimeUtc
+    $dashboardInputs = @(
       Get-ChildItem (Join-Path $RootDir "src"), (Join-Path $RootDir "public") -Recurse -File
       Get-Item (Join-Path $RootDir "index.html"), (Join-Path $RootDir "package-lock.json"), (Join-Path $RootDir "vite.config.ts")
     )
-    $buildRequired = $null -ne ($inputs | Where-Object { $_.LastWriteTimeUtc -gt $builtAt } | Select-Object -First 1)
+    $jobHostBuiltAt = (Get-Item $jobHostStampPath).LastWriteTimeUtc
+    $jobHostInputs = @(
+      Get-Item (Join-Path $RootDir "scripts/AgyJobHost.cs"), (Join-Path $RootDir "scripts/build-agy-job-host.ps1")
+    )
+    $dashboardStale = $null -ne ($dashboardInputs |
+      Where-Object { $_.LastWriteTimeUtc -gt $dashboardBuiltAt } |
+      Select-Object -First 1)
+    $jobHostStale = $null -ne ($jobHostInputs |
+      Where-Object { $_.LastWriteTimeUtc -gt $jobHostBuiltAt } |
+      Select-Object -First 1)
+    $buildRequired = $dashboardStale -or $jobHostStale
   }
 
   if (-not $buildRequired) {
@@ -611,7 +628,10 @@ function Ensure-ProductionBuild {
     -RedirectStandardOutput (Join-Path $LogDir "desktop-build.log") `
     -RedirectStandardError (Join-Path $LogDir "desktop-build.err")
 
-  if ($process.ExitCode -ne 0 -or -not (Test-Path $indexPath)) {
+  if ($process.ExitCode -ne 0 -or
+      -not (Test-Path $indexPath) -or
+      -not (Test-Path $jobHostPath) -or
+      -not (Test-Path $jobHostStampPath)) {
     throw "Could not build the dashboard. See data/logs/desktop-build.err."
   }
 }
