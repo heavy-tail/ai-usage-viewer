@@ -3,7 +3,6 @@ name: Provider Compatibility Canary
 on:
   schedule:
     - cron: "17 */6 * * *"
-  workflow_dispatch:
 
 # Never run two PTY canaries against the same provider test profile at once.
 concurrency:
@@ -130,11 +129,19 @@ jobs:
             $env:DEPENDENCY_OUTCOME -eq "success" -and
             $env:CANARY_OUTCOME -eq "success"
           $reportPassed = $null -ne $source -and [bool] $source.passed
+          $expectedProviders = @("claude", "codex", "agy", "grok")
+          $actualProviders = @($providers | ForEach-Object { [string] $_.provider })
+          $uniqueProviders = @($actualProviders | Sort-Object -Unique)
+          $hasExactProviderSet =
+            $actualProviders.Count -eq $expectedProviders.Count -and
+            $uniqueProviders.Count -eq $expectedProviders.Count -and
+            @($expectedProviders | Where-Object { $uniqueProviders -cnotcontains $_ }).Count -eq 0 -and
+            @($uniqueProviders | Where-Object { $expectedProviders -cnotcontains $_ }).Count -eq 0
           $redacted = [ordered]@{
             schemaVersion = 1
             redacted = $true
             generatedAt = if ($null -ne $source) { [string] $source.generatedAt } else { (Get-Date).ToUniversalTime().ToString("o") }
-            passed = $commandPassed -and $reportPassed
+            passed = $commandPassed -and $reportPassed -and $hasExactProviderSet
             workflowRun = $env:RUN_URL
             providers = $providers
           }
@@ -287,15 +294,27 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          # Keep the redacted report, but remove only known runtime files inside
-          # this checkout. In particular, never leave PTY transcripts behind.
+          # Remove only known runtime files inside this checkout. In particular,
+          # never leave PTY transcripts or either compatibility report behind.
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          $dataDir = Join-Path $workspace "data"
+          $atomicTempTargets = @()
+          if (Test-Path -LiteralPath $dataDir) {
+            $atomicTempTargets = @(Get-ChildItem -LiteralPath $dataDir -File -Force -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -match '^(usage-snapshot\.json|compatibility-report\.json)\.\d+\.tmp$' -or
+                $_.Name -match '^refresh\.lock\.[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.tmp$'
+              } |
+              ForEach-Object { $_.FullName })
+          }
           $targets = @(
+            (Join-Path $workspace ".canary-artifacts"),
             (Join-Path $workspace "data/raw"),
             (Join-Path $workspace "data/usage-snapshot.json"),
+            (Join-Path $workspace "data/compatibility-report.json"),
             (Join-Path $workspace "data/refresh.lock"),
             (Join-Path $workspace "config.json")
-          )
+          ) + $atomicTempTargets
           foreach ($target in $targets) {
             $fullPath = [IO.Path]::GetFullPath($target)
             if (-not $fullPath.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {

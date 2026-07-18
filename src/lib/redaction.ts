@@ -2,6 +2,29 @@ import type { UsageSnapshot } from "../types";
 import { EMAIL_PATTERN } from "./patterns";
 
 const EMAIL_RE = new RegExp(EMAIL_PATTERN, "gi");
+const CREDENTIAL_PREFIX_PATTERN = String.raw`(?:[A-Za-z][A-Za-z0-9_-]*?)?`;
+const CREDENTIAL_KEY_PATTERN =
+  String.raw`${CREDENTIAL_PREFIX_PATTERN}(?:api[\s_-]?key|access[\s_-]?key(?:[\s_-]?id)?|secret[\s_-]?access[\s_-]?key|secret[\s_-]?key|private[\s_-]?key|signing[\s_-]?key|access[\s_-]?token|auth[\s_-]?token|refresh[\s_-]?token|bearer[\s_-]?token|token|client[\s_-]?secret|secret|password|passwd|pwd)`;
+const HEADER_SECRET_KEY_PATTERN =
+  String.raw`${CREDENTIAL_PREFIX_PATTERN}(?:(?:proxy[\s_-]?)?authorization|cookie|set[\s_-]?cookie)`;
+const CREDENTIAL_JSON_KEY_RE = new RegExp(
+  `("(?:${CREDENTIAL_KEY_PATTERN}|${HEADER_SECRET_KEY_PATTERN})"\\s*:\\s*)"(?:\\\\.|[^"\\\\])*"`,
+  "gi"
+);
+const AUTH_HEADER_RE =
+  /\b((?:proxy-)?authorization\s*:\s*)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
+const COOKIE_HEADER_RE =
+  /^([\t ]*(?:cookie|set-cookie)\s*:\s*)[^\r\n]*$/gim;
+const PREFIXED_HEADER_LINE_RE =
+  /^([\t ]*(?:(?!(?:proxy|set)[_-])[A-Za-z][A-Za-z0-9]*[_-])+(?:(?:proxy[_-]?)?authorization|cookie|set[_-]?cookie)\s*[:=]\s*)[^\r\n]*$/gim;
+const CREDENTIAL_ASSIGNMENT_RE = new RegExp(
+  `\\b(${CREDENTIAL_KEY_PATTERN}\\s*[:=]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s,;}&]+)`,
+  "gi"
+);
+const PROVIDER_TOKEN_RE =
+  /\b(?:sk-(?:proj-|svcacct-|ant-api\d{2}-)?[A-Za-z0-9_-]{16,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})\b/g;
+const WINDOWS_USER_PROFILE_RE =
+  /\b([A-Za-z]:(?:\\{1,2}|\/)(?:Users|Documents and Settings)(?:\\{1,2}|\/))([^\\/\r\n"]+)/gi;
 const ORG_LINE_RE =
   /^[\t ]*((?:org(?:anization)?)(?:[\s_-]?(?:id|name|label))?\s*[:=]\s*)[^\r\n]+$/gim;
 const ORG_KEY_RE =
@@ -25,10 +48,23 @@ const UUID_RE =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const REDACTION_MARKER_RE = /<redacted-[a-z-]+>/i;
 
-type IdentityKind = "organization" | "account" | "session" | "email";
+type IdentityKind =
+  | "organization"
+  | "account"
+  | "session"
+  | "email"
+  | "credential"
+  | "cookie";
 
 export function redactSensitiveText(text: string): string {
   return text
+    .replace(CREDENTIAL_JSON_KEY_RE, '$1"<redacted-credential>"')
+    .replace(AUTH_HEADER_RE, "$1$2 <redacted-credential>")
+    .replace(COOKIE_HEADER_RE, "$1<redacted-cookie>")
+    .replace(PREFIXED_HEADER_LINE_RE, "$1<redacted-credential>")
+    .replace(CREDENTIAL_ASSIGNMENT_RE, "$1<redacted-credential>")
+    .replace(PROVIDER_TOKEN_RE, "<redacted-provider-token>")
+    .replace(WINDOWS_USER_PROFILE_RE, "$1<redacted-user>")
     .replace(EMAIL_RE, "<redacted-email>")
     .replace(ORG_LINE_RE, "$1<redacted-org-id>")
     .replace(ORG_KEY_RE, "$1<redacted-org-id>")
@@ -101,6 +137,18 @@ function identityKindForKey(
   if (!key) return inheritedIdentity;
   const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
 
+  if (
+    /(?:apikey|accesskey(?:id)?|secretaccesskey|secretkey|privatekey|signingkey|token|clientsecret|secret|password|passwd|pwd)$/.test(
+      normalized
+    )
+  ) {
+    return "credential";
+  }
+  if (/(?:authorization|proxyauthorization)$/.test(normalized)) {
+    return "credential";
+  }
+  if (/(?:cookie|setcookie)$/.test(normalized)) return "cookie";
+
   if (/^(?:org|organization)(?:id|name|label)?$/.test(normalized)) {
     return "organization";
   }
@@ -126,5 +174,7 @@ function markerForIdentity(identity: IdentityKind): string {
   if (identity === "organization") return "<redacted-org-id>";
   if (identity === "session") return "<redacted-session-id>";
   if (identity === "email") return "<redacted-email>";
+  if (identity === "credential") return "<redacted-credential>";
+  if (identity === "cookie") return "<redacted-cookie>";
   return "<redacted-account-id>";
 }

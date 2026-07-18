@@ -23,23 +23,23 @@ describe("Claude usage compatibility", () => {
     expect(pick(limits, "claude:session")).toMatchObject({
       scope: "Current session",
       window: "session",
-      usedPercent: 23,
-      resetLabel: "Resets 8:10pm (Asia/Seoul)",
+      usedPercent: 17,
+      resetLabel: "Resets 1:23am (Fixture/UTC)",
     });
     expect(pick(limits, "claude:week-all")).toMatchObject({
       scope: "Current week (all models)",
       window: "weekly",
-      usedPercent: 5,
+      usedPercent: 42,
     });
-    expect(pick(limits, "claude:week-fable")).toMatchObject({
-      scope: "Current week (Fable)",
+    expect(pick(limits, "claude:week-fixture-model")).toMatchObject({
+      scope: "Current week (Fixture Model)",
       window: "weekly",
-      usedPercent: 6,
+      usedPercent: 63,
     });
     expect(pick(limits, "claude:usage-credits")).toMatchObject({
       scope: "Usage credits",
-      usedPercent: 11,
-      remainingPercent: 89,
+      usedPercent: 8,
+      remainingPercent: 92,
     });
   });
 

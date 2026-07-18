@@ -66,6 +66,7 @@ export function buildCompatibilityReport(
     schemaVersion: 1,
     generatedAt: snapshot.generatedAt,
     passed:
+      enabled.size > 0 &&
       hasExactlyOneResultPerEnabledProvider &&
       providers.length === enabled.size &&
       providers.every((provider) => provider.passed),

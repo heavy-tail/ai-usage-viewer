@@ -63,6 +63,13 @@ describe("compatibility report", () => {
       "claude",
     ]);
   });
+
+  it("fails when no providers are enabled", () => {
+    const report = buildCompatibilityReport(snapshot(), []);
+
+    expect(report.passed).toBe(false);
+    expect(report.providers).toEqual([]);
+  });
 });
 
 function snapshot(): UsageSnapshot {

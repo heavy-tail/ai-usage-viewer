@@ -109,26 +109,6 @@ function Read-ManagedServerState {
   }
 }
 
-function Get-VerifiedStateProcess {
-  param([object] $State)
-
-  if (-not $State -or
-      [string]$State.backendFingerprint -notmatch '^[a-fA-F0-9]{64}$') {
-    return $null
-  }
-  try {
-    $managedProcess = Get-Process -Id ([int]$State.pid) -ErrorAction Stop
-    $recordedStart = [DateTime]::Parse([string]$State.processStartedAtUtc).ToUniversalTime()
-    $actualStart = $managedProcess.StartTime.ToUniversalTime()
-    if ([Math]::Abs(($actualStart - $recordedStart).TotalSeconds) -gt 5) {
-      return $null
-    }
-    return $managedProcess
-  } catch {
-    return $null
-  }
-}
-
 function Get-ServerIdentity {
   try {
     $identity = Invoke-RestMethod -Uri $IdentityUrl -TimeoutSec 2
@@ -202,24 +182,221 @@ function Test-LegacyUsageApi {
   }
 }
 
-function Get-VerifiedLegacyListenerProcess {
-  # A pre-identity server may have no usable state file. In that case, prove
-  # ownership from the actual loopback listener and its command line. The
-  # legacy npm script always ran this repo's tsx loader with src/server.ts; both
-  # the absolute loader path and entrypoint must match before it can be stopped.
+function ConvertFrom-WindowsCommandLine {
+  param([string] $CommandLine)
+
+  if (-not ("UsageViewer.LauncherCommandLine" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace UsageViewer {
+  public static class LauncherCommandLine {
+    [DllImport("shell32.dll", SetLastError = true)]
+    private static extern IntPtr CommandLineToArgvW(
+      [MarshalAs(UnmanagedType.LPWStr)] string commandLine,
+      out int argumentCount
+    );
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    public static string[] Split(string commandLine) {
+      int count;
+      IntPtr arguments = CommandLineToArgvW(commandLine, out count);
+      if (arguments == IntPtr.Zero) {
+        throw new Win32Exception(Marshal.GetLastWin32Error());
+      }
+
+      try {
+        string[] result = new string[count];
+        for (int index = 0; index < count; index++) {
+          IntPtr value = Marshal.ReadIntPtr(arguments, index * IntPtr.Size);
+          result[index] = Marshal.PtrToStringUni(value);
+        }
+        return result;
+      } finally {
+        LocalFree(arguments);
+      }
+    }
+  }
+}
+'@ | Out-Null
+  }
+
+  return [UsageViewer.LauncherCommandLine]::Split($CommandLine)
+}
+
+function Resolve-ViewerCommandFileArgument {
+  param([string] $Argument)
+
+  if ([string]::IsNullOrWhiteSpace($Argument)) {
+    return $null
+  }
+
   try {
-    $listeners = @(
-      Get-NetTCPConnection `
-        -LocalAddress "127.0.0.1" `
-        -LocalPort 4317 `
-        -State Listen `
-        -ErrorAction Stop
-    )
-    if ($listeners.Count -ne 1) {
+    $candidate = $Argument
+    if ($Argument.StartsWith("file:", [System.StringComparison]::OrdinalIgnoreCase)) {
+      $uri = [Uri]$Argument
+      if (-not $uri.IsAbsoluteUri -or
+          -not $uri.IsFile -or
+          $uri.Query.Length -gt 0 -or
+          $uri.Fragment.Length -gt 0) {
+        return $null
+      }
+      $candidate = $uri.LocalPath
+    } elseif ($Argument -match '^[a-zA-Z][a-zA-Z0-9+.-]*:' -and
+              $Argument -notmatch '^[a-zA-Z]:[\\/]') {
+      # Reject non-file URI schemes rather than treating them as relative paths.
       return $null
     }
 
-    $ownerPid = [int]$listeners[0].OwningProcess
+    if (-not [System.IO.Path]::IsPathRooted($candidate)) {
+      $candidate = Join-Path $RootDir $candidate
+    }
+    return [System.IO.Path]::GetFullPath($candidate).TrimEnd("\")
+  } catch {
+    return $null
+  }
+}
+
+function Test-ViewerServerCommand {
+  param([string] $CommandLine)
+
+  $arguments = @(ConvertFrom-WindowsCommandLine -CommandLine $CommandLine)
+  if ($arguments.Count -lt 2) {
+    return $false
+  }
+
+  $serverEntry = [System.IO.Path]::GetFullPath(
+    (Join-Path $RootDir "src\server.ts")
+  ).TrimEnd("\")
+  $runtimeRoot = [System.IO.Path]::GetFullPath(
+    (Join-Path $RootDir "node_modules\tsx\dist")
+  ).TrimEnd("\")
+  $runtimePrefix = "$runtimeRoot\"
+  $entryPoint = $null
+  $hasRepoRuntimeLoader = $false
+
+  for ($index = 1; $index -lt $arguments.Count; $index++) {
+    $argument = [string]$arguments[$index]
+
+    # Only a value attached to Node's actual loader switches can prove that
+    # this checkout's tsx runtime is active. A path supplied as an arbitrary
+    # application argument is not authority to terminate the listener.
+    $loaderArgument = $null
+    if ($argument -match '^(?i)--(?:import|require)=(.+)$') {
+      $loaderArgument = $Matches[1]
+    } elseif ($argument -in @("--import", "--require", "-r")) {
+      if ($index + 1 -ge $arguments.Count) {
+        return $false
+      }
+      $index++
+      $loaderArgument = [string]$arguments[$index]
+    }
+
+    if ($loaderArgument) {
+      $canonicalLoader = Resolve-ViewerCommandFileArgument `
+        -Argument $loaderArgument
+      if ($canonicalLoader -and $canonicalLoader.StartsWith(
+            $runtimePrefix,
+            [System.StringComparison]::OrdinalIgnoreCase
+          )) {
+        $hasRepoRuntimeLoader = $true
+      }
+      continue
+    }
+
+    # Fail closed when Node is running code through an alternate execution
+    # mode. In those modes a later server.ts token can be only an argument,
+    # not the program that owns the listener.
+    if ($argument -match '^(?i)(?:-e(?:$|=|[^-])|--eval(?:$|=)|-p(?:$|=|[^-])|--print(?:$|=)|-c$|--check$|--run(?:$|=)|--test(?:$|=|-))') {
+      return $false
+    }
+
+    # A lone dash executes JavaScript from stdin. After Node's end-of-options
+    # marker, the very next token is the entry point even when it starts with
+    # a dash; never interpret later tokens as Node loader switches.
+    if ($argument -eq "-") {
+      return $false
+    }
+    if ($argument -eq "--") {
+      if ($index + 1 -ge $arguments.Count) {
+        return $false
+      }
+      $index++
+      $entryPoint = Resolve-ViewerCommandFileArgument `
+        -Argument ([string]$arguments[$index])
+      break
+    }
+
+    # Remaining dash-prefixed values are Node flags. The first non-option
+    # token is Node's actual application entry point; ignore all later
+    # application arguments so decoy paths cannot satisfy this proof.
+    if ($argument.StartsWith("-", [System.StringComparison]::Ordinal)) {
+      continue
+    }
+    $entryPoint = Resolve-ViewerCommandFileArgument -Argument $argument
+    break
+  }
+
+  return $hasRepoRuntimeLoader -and
+    $entryPoint -and
+    $entryPoint.Equals(
+      $serverEntry,
+      [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Get-VerifiedViewerListenerProcess {
+  param(
+    [int] $ExpectedProcessId = 0,
+    [string] $ExpectedStartedAtUtc
+  )
+
+  # A PID, state file, or HTTP response is never sufficient authority to stop
+  # a process. Prove that the PID owns the exact loopback listener and that its
+  # command uses this checkout's tsx runtime to run this checkout's server.
+  try {
+    $ownerPids = @()
+    try {
+      $ownerPids = @(
+        Get-NetTCPConnection `
+          -LocalAddress "127.0.0.1" `
+          -LocalPort 4317 `
+          -State Listen `
+          -ErrorAction Stop |
+          ForEach-Object { [int]$_.OwningProcess }
+      )
+    } catch {
+      # Some standard-user policies deny the NetTCPConnection CIM provider.
+      # netstat still reports the kernel's listener/PID mapping without
+      # requiring elevation; accept only one exact IPv4 LISTENING row.
+      $netstatPath = Join-Path $env:SystemRoot "System32\netstat.exe"
+      $netstatOutput = @(& $netstatPath -ano -p tcp 2>$null)
+      if ($LASTEXITCODE -ne 0) {
+        return $null
+      }
+      $ownerPids = @(
+        $netstatOutput | ForEach-Object {
+          if ($_ -match '^\s*TCP\s+127\.0\.0\.1:4317\s+\S+\s+LISTENING\s+(\d+)\s*$') {
+            [int]$Matches[1]
+          }
+        }
+      )
+    }
+
+    $ownerPids = @($ownerPids | Select-Object -Unique)
+    if ($ownerPids.Count -ne 1) {
+      return $null
+    }
+
+    $ownerPid = [int]$ownerPids[0]
+    if ($ExpectedProcessId -gt 0 -and $ownerPid -ne $ExpectedProcessId) {
+      return $null
+    }
+
     $record = Get-CimInstance `
       Win32_Process `
       -Filter "ProcessId = $ownerPid" `
@@ -229,22 +406,31 @@ function Get-VerifiedLegacyListenerProcess {
       return $null
     }
 
-    $commandLine = [string]$record.CommandLine
-    $expectedRuntime = Join-Path $RootDir "node_modules\tsx\dist"
-    if ($commandLine.IndexOf(
-          $expectedRuntime,
-          [System.StringComparison]::OrdinalIgnoreCase
-        ) -lt 0 -or
-        $commandLine -notmatch '(?i)(?:^|[\s"])src[\\/]server\.ts(?:[\s"]|$)') {
+    if (-not (Test-ViewerServerCommand -CommandLine ([string]$record.CommandLine))) {
       return $null
     }
 
-    return Get-Process -Id $ownerPid -ErrorAction Stop
+    $listenerProcess = Get-Process -Id $ownerPid -ErrorAction Stop
+    if ($ExpectedStartedAtUtc) {
+      $expectedStart = [DateTime]::Parse($ExpectedStartedAtUtc).ToUniversalTime()
+      $actualStart = $listenerProcess.StartTime.ToUniversalTime()
+      if ([Math]::Abs(($actualStart - $expectedStart).TotalSeconds) -gt 5) {
+        return $null
+      }
+    }
+
+    return $listenerProcess
   } catch {
     # Listener/process inspection can be unavailable under a locked-down
     # policy. Failing closed leaves the unknown process untouched.
     return $null
   }
+}
+
+function Get-VerifiedLegacyListenerProcess {
+  # Legacy servers have no identity endpoint, so only actual listener ownership
+  # plus the repository-specific command can authorize a migration restart.
+  return Get-VerifiedViewerListenerProcess
 }
 
 function Test-ViewerPortOpen {
@@ -262,19 +448,28 @@ function Test-ViewerPortOpen {
 function Stop-VerifiedServerProcess {
   param([object] $Process)
 
-  try {
-    $current = Get-Process -Id ([int]$Process.Id) -ErrorAction Stop
-    if ([Math]::Abs(
-          ($current.StartTime.ToUniversalTime() -
-           $Process.StartTime.ToUniversalTime()).TotalSeconds
-        ) -gt 2) {
-      throw "PID was reused."
-    }
-  } catch {
+  $expectedPid = [int]$Process.Id
+  $expectedStart = $Process.StartTime.ToUniversalTime().ToString("o")
+
+  # Verify twice here, independently of the caller. The final check is
+  # deliberately adjacent to taskkill to narrow the unavoidable PID-reuse
+  # race between Windows process inspection and tree termination.
+  $verified = Get-VerifiedViewerListenerProcess `
+    -ExpectedProcessId $expectedPid `
+    -ExpectedStartedAtUtc $expectedStart
+  if (-not $verified) {
     throw "The verified AI Usage Viewer process changed before restart, so it was left untouched."
   }
 
-  & taskkill.exe /pid $Process.Id /T /F | Out-Null
+  $verified = Get-VerifiedViewerListenerProcess `
+    -ExpectedProcessId $expectedPid `
+    -ExpectedStartedAtUtc $expectedStart
+  if (-not $verified) {
+    throw "The verified AI Usage Viewer process changed before restart, so it was left untouched."
+  }
+
+  $taskkillPath = Join-Path $env:SystemRoot "System32\taskkill.exe"
+  & $taskkillPath /pid $expectedPid /T /F | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Could not restart the verified AI Usage Viewer server."
   }
@@ -422,21 +617,60 @@ function Ensure-ProductionBuild {
 }
 
 function Start-LaunchRefresh {
-  $script = @"
-`$ErrorActionPreference = "Stop"
+  # The child script is fixed source: install paths and URLs are structured
+  # JSON data on stdin, never interpolated into executable code.
+  $refreshScript = @'
+$ErrorActionPreference = "Stop"
+$payloadJson = [System.Text.Encoding]::UTF8.GetString(
+  [Convert]::FromBase64String([Console]::In.ReadToEnd())
+)
+$payload = $payloadJson | ConvertFrom-Json
+$refreshUrl = [string]$payload.refreshUrl
+$successLog = [string]$payload.successLog
+$errorLog = [string]$payload.errorLog
+$utf8 = New-Object System.Text.UTF8Encoding($false)
 try {
-  Invoke-RestMethod -Uri "$RefreshUrl" -Method Post | Out-Null
-  "Refresh completed at `$((Get-Date).ToString("s"))" | Set-Content -Path "$((Join-Path $LogDir "desktop-refresh.log"))"
+  Invoke-RestMethod -Uri ([Uri]$refreshUrl) -Method Post | Out-Null
+  [System.IO.File]::WriteAllText(
+    $successLog,
+    "Refresh completed at $((Get-Date).ToString("s"))",
+    $utf8
+  )
 } catch {
-  `$_.Exception.Message | Set-Content -Path "$((Join-Path $LogDir "desktop-refresh.err"))"
+  [System.IO.File]::WriteAllText($errorLog, $_.Exception.Message, $utf8)
 }
-"@
+'@
 
-  Start-Process `
-    -FilePath "powershell.exe" `
-    -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", $script) `
-    -WorkingDirectory $RootDir `
-    -WindowStyle Hidden | Out-Null
+  $encodedScript = [Convert]::ToBase64String(
+    [System.Text.Encoding]::Unicode.GetBytes($refreshScript)
+  )
+  $payloadJson = @{
+    refreshUrl = $RefreshUrl
+    successLog = (Join-Path $LogDir "desktop-refresh.log")
+    errorLog = (Join-Path $LogDir "desktop-refresh.err")
+  } | ConvertTo-Json -Compress
+  $encodedPayload = [Convert]::ToBase64String(
+    [System.Text.Encoding]::UTF8.GetBytes($payloadJson)
+  )
+  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $startInfo.FileName = Join-Path `
+    $env:SystemRoot `
+    "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $startInfo.Arguments =
+    "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedScript"
+  $startInfo.WorkingDirectory = $RootDir
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardInput = $true
+  $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+
+  $refreshProcess = [System.Diagnostics.Process]::Start($startInfo)
+  if (-not $refreshProcess) {
+    throw "Could not start the background usage refresh."
+  }
+  $refreshProcess.StandardInput.Write($encodedPayload)
+  $refreshProcess.StandardInput.Close()
+  $refreshProcess.Dispose()
 }
 
 function Find-AppBrowser {
@@ -503,18 +737,21 @@ try {
     } else {
       # This is definitely our server, but it is an older source build or an
       # API-only instance. Replace it without exposing migration work to users.
-      Stop-VerifiedServerProcess -Process $identityProcess
+      $restartProcess = Get-VerifiedViewerListenerProcess `
+        -ExpectedProcessId ([int]$identity.pid) `
+        -ExpectedStartedAtUtc ([string]$identity.processStartedAtUtc)
+      if (-not $restartProcess) {
+        throw "AI Usage Viewer needs a restart, but its listener and repository command could not be verified. It was left untouched."
+      }
+      Stop-VerifiedServerProcess -Process $restartProcess
     }
   } elseif (Test-LegacyUsageApi) {
-    # Servers from before the identity endpoint can still be migrated. Prefer
-    # proving the actual listener runs this exact repo; retain verified legacy
-    # PID/start state as a fallback for systems that restrict listener queries.
+    # Servers from before the identity endpoint can still be migrated, but only
+    # when the actual listener runs this exact repo. A state-file PID is never
+    # authority to terminate a process.
     $legacyProcess = Get-VerifiedLegacyListenerProcess
     if (-not $legacyProcess) {
-      $legacyProcess = Get-VerifiedStateProcess -State (Read-ManagedServerState)
-    }
-    if (-not $legacyProcess) {
-      throw "A legacy API is using port 4317, but its listener and managed state could not be verified. It was left untouched."
+      throw "A legacy API is using port 4317, but its listener could not be verified as this repository's server. It was left untouched."
     }
     Stop-VerifiedServerProcess -Process $legacyProcess
   } elseif (Test-ViewerPortOpen) {
