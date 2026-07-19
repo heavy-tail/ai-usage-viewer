@@ -1,12 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { UsageProvider, UsageSnapshot } from "./types";
 import type { CompatibilityReport } from "./compatibilityReport";
-import {
-  redactSensitiveText,
-  redactSensitiveValue,
-  redactSnapshot,
-} from "./lib/redaction";
+import { redactSensitiveValue, redactSnapshot } from "./lib/redaction";
 import { validateSnapshotShape } from "./snapshot";
 
 const SNAPSHOT_FILE = join("data", "usage-snapshot.json");
@@ -53,29 +49,9 @@ export async function writeCompatibilityReport(
   await rename(tmp, target);
 }
 
-export async function writeRawOutput(
-  rootDir: string,
-  fileName: string,
-  output: string
-): Promise<void> {
-  await mkdir(join(rootDir, RAW_DIR), { recursive: true });
-  await writeFile(
-    join(rootDir, RAW_DIR, fileName),
-    `${redactSensitiveText(output).trim()}\n`,
-    "utf8"
-  );
-}
-
-export async function readRawOutput(
-  rootDir: string,
-  provider: UsageProvider
-): Promise<string | null> {
-  const fileName = rawFileNameForProvider(provider);
-  try {
-    return await readFile(join(rootDir, RAW_DIR, fileName), "utf8");
-  } catch {
-    return null;
-  }
+/** Remove legacy terminal transcripts; new refreshes never persist them. */
+export async function purgeRawOutputs(rootDir: string): Promise<void> {
+  await rm(join(rootDir, RAW_DIR), { recursive: true, force: true });
 }
 
 export function rawFileNameForProvider(provider: UsageProvider): string {

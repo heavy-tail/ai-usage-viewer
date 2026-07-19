@@ -1,7 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { createServer, connect, type Server } from "node:net";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
 const LOCK_FILE = join("data", "refresh.lock");
 const PIPE_PROBE_TIMEOUT_MS = 1_000;
@@ -20,7 +27,7 @@ export type ReleaseRefreshLock = () => Promise<void>;
  * pathname cannot provide compare-and-delete semantics during stale cleanup.
  */
 export async function isRefreshLockHeld(rootDir: string): Promise<boolean> {
-  return canConnect(lockPipeName(rootDir));
+  return canConnect(await lockPipeName(rootDir));
 }
 
 /**
@@ -38,7 +45,7 @@ export async function tryAcquireRefreshLock(
   const server = createServer((socket) => socket.end());
   server.unref();
   try {
-    await listen(server, lockPipeName(rootDir));
+    await listen(server, await lockPipeName(rootDir));
   } catch (error) {
     if (hasCode(error, "EADDRINUSE")) return undefined;
     throw error;
@@ -69,8 +76,10 @@ export async function tryAcquireRefreshLock(
   };
 }
 
-function lockPipeName(rootDir: string): string {
-  const workspace = resolve(rootDir).toLowerCase();
+async function lockPipeName(rootDir: string): Promise<string> {
+  // Hash the filesystem's canonical path, not a lexical spelling. Junctions,
+  // symlinks, and 8.3 aliases must all compete for the same workspace lock.
+  const workspace = (await realpath(rootDir)).toLowerCase();
   const digest = createHash("sha256").update(workspace).digest("hex").slice(0, 24);
   // This application and its PTY collectors are Windows-only. A named pipe is
   // kernel-owned, so crashes cannot leave a stale mutex behind.

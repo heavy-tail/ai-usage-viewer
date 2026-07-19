@@ -38,6 +38,23 @@ describe("Claude collector compatibility", () => {
     expect(result.state).toBe("ok");
     expect(ptyRunner).toHaveBeenCalledWith(expect.objectContaining({ args: [] }));
   });
+
+  it("does not mark Claude's cached fallback usage as newly verified", async () => {
+    const cachedOutput = `${usageOutput}\nShowing last-known usage as of 3m ago (could not refresh)`;
+    const ptyRunner = vi.fn(async () => ({
+      rawOutput: cachedOutput,
+      cleanedOutput: cachedOutput,
+    })) as unknown as PtyRunner;
+
+    const result = await collectClaude(context(ptyRunner, true));
+
+    expect(result).toMatchObject({
+      ok: false,
+      state: "unavailable",
+      limits: [],
+      error: "Claude CLI could not refresh its usage data.",
+    });
+  });
 });
 
 function successfulPty(): PtyRunner {

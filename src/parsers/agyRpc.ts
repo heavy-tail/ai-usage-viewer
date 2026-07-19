@@ -11,6 +11,8 @@ const MAX_LABEL_LENGTH = 256;
 const MAX_WINDOW_LENGTH = 128;
 const MAX_ID_LENGTH = 512;
 const MAX_DESCRIPTION_LENGTH = 4_096;
+const ROOT_FIELDS = new Set(["response"]);
+const RESPONSE_FIELDS = new Set(["description", "groups", "buckets"]);
 const GROUP_FIELDS = new Set(["displayName", "description", "buckets"]);
 const BUCKET_FIELDS = new Set([
   "bucketId",
@@ -51,6 +53,13 @@ export function parseAgyRpcQuota(
   if (!root || !response) {
     throwDrift("Agy local quota API response did not contain a response object.");
   }
+  rejectUnknownUsageFields(root, ROOT_FIELDS, "root", throwDrift);
+  rejectUnknownUsageFields(
+    response,
+    RESPONSE_FIELDS,
+    "quota response",
+    throwDrift
+  );
 
   const groups = response.groups;
   if (!Array.isArray(groups) || groups.length === 0) {
@@ -251,10 +260,7 @@ function rejectUnknownUsageFields(
   drift: (message: string) => never
 ): void {
   for (const field of Object.keys(record)) {
-    if (
-      !allowed.has(field) &&
-      /(?:fraction|percent|amount|reset|window|disabled|quota|limit)/i.test(field)
-    ) {
+    if (!allowed.has(field)) {
       drift(`Agy ${path} contained an unrecognized usage field "${field}".`);
     }
   }

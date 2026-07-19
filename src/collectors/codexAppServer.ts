@@ -1,13 +1,19 @@
 import {
+  execFile,
   spawn,
   type ChildProcessWithoutNullStreams,
   type SpawnOptionsWithoutStdio,
 } from "node:child_process";
+import { promisify } from "node:util";
 import packageMetadata from "../../package.json";
 
 const INITIALIZE_REQUEST_ID = 1;
 const RATE_LIMITS_REQUEST_ID = 2;
 const DEFAULT_TIMEOUT_MS = 8_000;
+const DEFAULT_TERMINATION_TIMEOUT_MS = 3_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+const execFileAsync = promisify(execFile);
 
 type JsonRpcMessage = {
   id?: number;
@@ -39,7 +45,16 @@ export type CodexAppServerReader = (input: {
   spawnProcess?: CodexAppServerSpawn;
   platform?: NodeJS.Platform;
   windowsCommandShell?: string;
+  maxOutputBytes?: number;
+  terminationTimeoutMs?: number;
+  terminateProcess?: CodexAppServerTerminate;
 }) => Promise<CodexAppServerResult>;
+
+export type CodexAppServerTerminate = (
+  child: ChildProcessWithoutNullStreams,
+  platform: NodeJS.Platform,
+  timeoutMs: number
+) => Promise<void>;
 
 export class CodexAppServerError extends Error {
   readonly diagnosticText: string;
@@ -63,7 +78,20 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
   spawnProcess = defaultSpawn,
   platform = process.platform,
   windowsCommandShell = process.env.ComSpec ?? "cmd.exe",
+  maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+  terminationTimeoutMs = DEFAULT_TERMINATION_TIMEOUT_MS,
+  terminateProcess = terminateAppServerProcess,
 }) => {
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
+    throw new CodexAppServerError(
+      "Codex app-server maxOutputBytes must be a positive integer."
+    );
+  }
+  if (!Number.isSafeInteger(terminationTimeoutMs) || terminationTimeoutMs <= 0) {
+    throw new CodexAppServerError(
+      "Codex app-server terminationTimeoutMs must be a positive integer."
+    );
+  }
   let child: ChildProcessWithoutNullStreams;
   try {
     const launch = appServerLaunch(platform, windowsCommandShell);
@@ -79,10 +107,11 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
   }
 
   return new Promise<CodexAppServerResult>((resolve, reject) => {
-    let settled = false;
+    let finishing = false;
     let stdoutBuffer = "";
     let stderrText = "";
-    const transcript: string[] = [];
+    let transcriptText = "";
+    let outputBytes = 0;
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -92,30 +121,51 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
     }, timeoutMs);
 
     const diagnosticText = () =>
-      [...transcript, stderrText.trim()].filter(Boolean).join("\n");
+      [transcriptText.trim(), stderrText.trim()].filter(Boolean).join("\n");
 
-    const stop = () => {
+    const finish = async (
+      outcome: { payload: unknown } | { error: CodexAppServerError }
+    ): Promise<void> => {
+      if (finishing) return;
+      finishing = true;
       clearTimeout(timer);
       child.stdin.end();
-      if (child.exitCode == null && !child.killed) child.kill();
+      try {
+        await terminateProcess(child, platform, terminationTimeoutMs);
+      } catch {
+        reject(
+          new CodexAppServerError(
+            "Codex app-server could not be fully terminated.",
+            diagnosticText()
+          )
+        );
+        return;
+      }
+
+      if ("error" in outcome) {
+        reject(outcome.error);
+      } else {
+        resolve({
+          payload: outcome.payload,
+          rawText: JSON.stringify(outcome.payload, null, 2),
+        });
+      }
     };
 
     const succeed = (payload: unknown) => {
-      if (settled) return;
-      settled = true;
-      stop();
-      resolve({ payload, rawText: JSON.stringify(payload, null, 2) });
+      if (finishing) return;
+      void finish({ payload });
     };
 
     function fail(message: string): void {
-      if (settled) return;
-      settled = true;
-      stop();
-      reject(new CodexAppServerError(message, diagnosticText()));
+      if (finishing) return;
+      void finish({
+        error: new CodexAppServerError(message, diagnosticText()),
+      });
     }
 
     const send = (message: JsonRpcMessage) => {
-      if (settled) return;
+      if (finishing) return;
       try {
         child.stdin.write(`${JSON.stringify(message)}\n`);
       } catch (error) {
@@ -125,8 +175,11 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
 
     const handleLine = (line: string) => {
       const trimmed = line.trim();
-      if (!trimmed || settled) return;
-      transcript.push(trimmed);
+      if (!trimmed || finishing) return;
+      transcriptText = boundedTail(
+        `${transcriptText}${trimmed}\n`,
+        MAX_DIAGNOSTIC_BYTES
+      );
 
       let message: JsonRpcMessage;
       try {
@@ -168,6 +221,7 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
     };
 
     child.stdout.on("data", (chunk: string) => {
+      if (!acceptOutput(chunk)) return;
       stdoutBuffer += chunk;
       const lines = stdoutBuffer.split(/\r?\n/);
       stdoutBuffer = lines.pop() ?? "";
@@ -178,7 +232,11 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
       stdoutBuffer = "";
     });
     child.stderr.on("data", (chunk: string) => {
-      stderrText += chunk;
+      if (!acceptOutput(chunk)) return;
+      stderrText = boundedTail(
+        stderrText + chunk,
+        MAX_DIAGNOSTIC_BYTES
+      );
     });
     child.stdin.on("error", (error) => {
       fail(`Codex app-server stdin failed: ${errorMessage(error)}`);
@@ -187,10 +245,18 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
       fail(`Codex app-server process failed: ${errorMessage(error)}`);
     });
     child.once("exit", (code, signal) => {
-      if (settled) return;
+      if (finishing) return;
       const detail = signal ? `signal ${signal}` : `exit code ${String(code)}`;
       fail(`Codex app-server exited before returning rate limits (${detail}).`);
     });
+
+    function acceptOutput(chunk: string): boolean {
+      if (finishing) return false;
+      outputBytes += Buffer.byteLength(chunk, "utf8");
+      if (outputBytes <= maxOutputBytes) return true;
+      fail(`Codex app-server output exceeded ${maxOutputBytes} bytes.`);
+      return false;
+    }
 
     send({
       method: "initialize",
@@ -205,6 +271,69 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
     });
   });
 };
+
+async function terminateAppServerProcess(
+  child: ChildProcessWithoutNullStreams,
+  platform: NodeJS.Platform,
+  timeoutMs: number
+): Promise<void> {
+  if (hasExited(child)) return;
+
+  // Closing stdin gives a cooperative app-server a brief chance to stop.
+  if (await waitForChildExit(child, Math.min(150, timeoutMs))) return;
+
+  if (platform === "win32" && Number.isInteger(child.pid) && child.pid! > 0) {
+    try {
+      await execFileAsync(
+        "taskkill.exe",
+        ["/pid", String(child.pid), "/T", "/F"],
+        { windowsHide: true, timeout: timeoutMs }
+      );
+    } catch {
+      // The process can exit between inspection and taskkill. The verified
+      // exit wait below decides whether a fallback signal is still required.
+    }
+    if (await waitForChildExit(child, timeoutMs)) return;
+  }
+
+  if (!hasExited(child)) child.kill("SIGKILL");
+  if (!(await waitForChildExit(child, timeoutMs))) {
+    throw new Error("Codex app-server did not exit after termination.");
+  }
+}
+
+function hasExited(child: ChildProcessWithoutNullStreams): boolean {
+  return child.exitCode != null || child.signalCode != null;
+}
+
+function waitForChildExit(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number
+): Promise<boolean> {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise((resolveExit) => {
+    const done = () => {
+      clearTimeout(timer);
+      child.off("exit", done);
+      child.off("close", done);
+      resolveExit(true);
+    };
+    const timer = setTimeout(() => {
+      child.off("exit", done);
+      child.off("close", done);
+      resolveExit(hasExited(child));
+    }, timeoutMs);
+    child.once("exit", done);
+    child.once("close", done);
+  });
+}
+
+function boundedTail(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, "utf8");
+  return bytes.byteLength <= maxBytes
+    ? text
+    : bytes.subarray(-maxBytes).toString("utf8");
+}
 
 const defaultSpawn: CodexAppServerSpawn = (command, args, options) =>
   spawn(command, args, options);

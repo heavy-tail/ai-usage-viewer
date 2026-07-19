@@ -30,9 +30,16 @@ export async function loadConfig(rootDir: string): Promise<AppConfig> {
   let text: string;
   try {
     text = await readFile(join(rootDir, "config.json"), "utf8");
-  } catch {
-    // No config file on disk → safe defaults. A *missing* config is expected.
-    return DEFAULT_CONFIG;
+  } catch (error) {
+    // Only a genuinely missing file may enable the defaults. Permission,
+    // device, and decoding failures must fail closed instead of silently
+    // enabling collectors the user may have disabled.
+    if (isMissingFileError(error)) return DEFAULT_CONFIG;
+    throw new Error(
+      `Unable to read config.json: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
   }
 
   // A present-but-malformed config must NOT silently fall back to defaults:
@@ -53,7 +60,7 @@ export async function loadConfig(rootDir: string): Promise<AppConfig> {
 }
 
 function mergeConfig(parsed: Partial<AppConfig>): AppConfig {
-  return {
+  const config = {
     ...DEFAULT_CONFIG,
     ...parsed,
     enabledProviders: normalizeProviders(
@@ -80,9 +87,31 @@ function mergeConfig(parsed: Partial<AppConfig>): AppConfig {
       ...parsed.planLabelFallback,
     },
   };
+  assertValidTimeZone(config.timezone);
+  return config;
 }
 
 function normalizeProviders(values: UsageProvider[]): UsageProvider[] {
   const allowed: UsageProvider[] = ["claude", "codex", "agy", "grok"];
   return values.filter((value): value is UsageProvider => allowed.includes(value));
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (
+    error != null &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
+}
+
+function assertValidTimeZone(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("config.json timezone must be a non-empty IANA timezone.");
+  }
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+  } catch {
+    throw new Error(`config.json timezone ${JSON.stringify(value)} is invalid.`);
+  }
 }

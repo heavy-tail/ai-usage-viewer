@@ -79,10 +79,15 @@ describe("refresh service", () => {
     expect(snapshot.collectors.find((c) => c.provider === "claude")?.state).toBe(
       "ok"
     );
+    expect(snapshot.collectors.find((c) => c.provider === "claude")?.enabled).toBe(
+      true
+    );
     expect(snapshot.collectors.find((c) => c.provider === "codex")?.state).toBe(
       "error"
     );
     expect(snapshot.limits).toHaveLength(1);
+    expect(snapshot.timezone).toBe("Asia/Seoul");
+    expect(snapshot.limits[0].freshness).toBe("verified");
 
     const stored = JSON.parse(
       await readFile(join(rootDir, "data", "usage-snapshot.json"), "utf8")
@@ -90,7 +95,7 @@ describe("refresh service", () => {
     expect(stored.limits[0].accountLabel).toBe("<redacted-email>");
     await expect(
       readFile(join(rootDir, "data", "raw", "codex-default.txt"), "utf8")
-    ).resolves.toContain("clean error");
+    ).rejects.toMatchObject({ code: "ENOENT" });
     const compatibility = JSON.parse(
       await readFile(join(rootDir, "data", "compatibility-report.json"), "utf8")
     ) as { passed: boolean; providers: Array<{ provider: string; passed: boolean }> };
@@ -225,6 +230,8 @@ describe("refresh service", () => {
       ),
     });
     expect(snapshot.limits).toHaveLength(1);
+    expect(snapshot.timezone).toBe("Asia/Seoul");
+    expect(snapshot.limits[0].freshness).toBe("stale");
     expect(snapshot.limits[0]).toMatchObject({
       id: "claude:limit",
       provider: "claude",
@@ -305,6 +312,52 @@ describe("refresh service", () => {
       remainingPercent: 97,
       status: "available",
       statusLabel: "stale",
+      freshness: "stale",
+    });
+  });
+
+  it("preserves a verified hard stop when a later refresh fails", async () => {
+    const rootDir = await tempWorkspace(["codex"]);
+    const service = createRefreshService();
+
+    await service.refresh({
+      rootDir,
+      collectors: {
+        codex: async () =>
+          okResult("codex", [
+            {
+              ...limit("codex"),
+              usedPercent: 3,
+              remainingPercent: 97,
+              status: "exhausted",
+              blockingReason: "Workspace usage limit reached",
+            },
+          ]),
+      },
+    });
+
+    const snapshot = await service.refresh({
+      rootDir,
+      collectors: {
+        codex: async () => ({
+          provider: "codex",
+          ok: false,
+          state: "error",
+          checkedAt: "2026-06-03T12:00:01.000Z",
+          durationMs: 20,
+          limits: [],
+          rawText: "",
+          cleanedText: "",
+          rawFileName: "codex-default.txt",
+          error: "mock failure",
+        }),
+      },
+    });
+
+    expect(snapshot.limits[0]).toMatchObject({
+      status: "exhausted",
+      blockingReason: "Workspace usage limit reached",
+      freshness: "stale",
     });
   });
 
@@ -330,11 +383,42 @@ describe("refresh service", () => {
       ok: false,
       state: "stale",
       attemptState: "drift",
-      adapterVersion: "2.1.0",
+      adapterVersion: "2.2.0",
       error: expect.stringContaining("Adapter contract rejected"),
     });
     expect(snapshot.limits).toHaveLength(1);
     expect(snapshot.limits[0].id).toBe("claude:limit");
+  });
+
+  it("marks an otherwise healthy refresh when quota row identities change", async () => {
+    const rootDir = await tempWorkspace(["claude"]);
+    const service = createRefreshService();
+
+    await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => okResult("claude", [limit("claude")]),
+      },
+    });
+
+    const snapshot = await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () =>
+          okResult("claude", [{ ...limit("claude"), id: "claude:new-limit" }]),
+      },
+    });
+
+    expect(snapshot.collectors.find((item) => item.provider === "claude"))
+      .toMatchObject({
+        ok: true,
+        state: "ok",
+        rowInventoryChanged: true,
+      });
+    const report = JSON.parse(
+      await readFile(join(rootDir, "data", "compatibility-report.json"), "utf8")
+    ) as { passed: boolean };
+    expect(report.passed).toBe(false);
   });
 
   it("drops legacy Grok pay-as-you-go details from stale labels", async () => {
@@ -406,6 +490,7 @@ describe("refresh service", () => {
     const codex = snapshot.collectors.find((c) => c.provider === "codex");
     expect(codex?.ok).toBe(false);
     expect(codex?.state).toBe("unavailable");
+    expect(codex?.enabled).toBe(false);
     expect(snapshot.limits.some((l) => l.provider === "codex")).toBe(false);
   });
 });

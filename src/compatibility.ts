@@ -6,10 +6,10 @@ import type { ProviderCollectorResult } from "./collectors/types";
 // relevant value whenever a provider contract changes so snapshots and canary
 // reports identify exactly which compatibility code produced them.
 export const ADAPTER_VERSIONS: Record<UsageProvider, string> = {
-  claude: "2.1.0",
-  codex: "2.1.0",
-  agy: "2.0.0",
-  grok: "2.0.0",
+  claude: "2.2.0",
+  codex: "2.2.0",
+  agy: "2.1.0",
+  grok: "2.1.0",
 };
 
 /**
@@ -126,6 +126,8 @@ function validatePercent(
 }
 
 function normalizeFormat(text: string): string {
+  const structured = structuredJsonFormat(text);
+  if (structured) return structured;
   return text
     .normalize("NFKC")
     .toLowerCase()
@@ -148,4 +150,30 @@ function normalizeFormat(text: string): string {
     .replace(/\b\d+(?:\.\d+)?\b/g, "<number>")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function structuredJsonFormat(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return undefined;
+  try {
+    return JSON.stringify(jsonShape(JSON.parse(trimmed) as unknown));
+  } catch {
+    return undefined;
+  }
+}
+
+function jsonShape(value: unknown): unknown {
+  if (value === null) return "null";
+  if (Array.isArray(value)) {
+    const shapes = value.map(jsonShape).map((shape) => JSON.stringify(shape));
+    return { arrayOf: [...new Set(shapes)].sort().map((shape) => JSON.parse(shape)) };
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, nested]) => [key.normalize("NFKC"), jsonShape(nested)])
+    );
+  }
+  return `<${typeof value}>`;
 }

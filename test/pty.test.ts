@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { runPty } from "../src/collectors/pty";
-import { PtyTimeoutError } from "../src/collectors/errors";
+import { PtyProcessError, PtyTimeoutError } from "../src/collectors/errors";
 
 // Drives the real PTY engine against a short-lived `node -e` child. This is the
 // highest-risk module (terminal conversation + timeout/exit handling) and was
@@ -42,5 +42,21 @@ describe("runPty", () => {
     expect(result).toEqual(
       expect.objectContaining({ rawOutput: expect.any(String) })
     );
+  }, 15_000);
+
+  it("terminates a process that exceeds the output limit", async () => {
+    await expect(
+      runPty({
+        command: process.execPath,
+        args: ["-e", "process.stdout.write('x'.repeat(4096)); setTimeout(() => {}, 5000)"],
+        cwd: process.cwd(),
+        totalTimeoutMs: 10_000,
+        maxOutputBytes: 256,
+        steps: [{ waitFor: /never-matches/, timeoutMs: 8_000 }],
+      })
+    ).rejects.toMatchObject<PtyProcessError>({
+      name: "PtyProcessError",
+      message: "PTY output exceeded 256 bytes.",
+    });
   }, 15_000);
 });

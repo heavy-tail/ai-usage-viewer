@@ -123,6 +123,21 @@ describe("provider parser completeness", () => {
     expect(rows.map((row) => row.id)).toEqual(["grok:weekly", "grok:monthly"]);
   });
 
+  it("does not borrow a reset time from the next Grok quota section", () => {
+    const rows = parseGrokUsage(
+      [
+        "Weekly limit: 20%",
+        "Monthly limit: 30% Next reset: August 31, 16:00 PT",
+      ].join("\n"),
+      meta
+    );
+
+    expect(rows.find((row) => row.id === "grok:weekly")?.resetLabel).toBeUndefined();
+    expect(rows.find((row) => row.id === "grok:monthly")?.resetLabel).toBe(
+      "Resets August 31, 16:00 PT"
+    );
+  });
+
   it("parses Grok 0.2.67 weekly usage detail and verifies its footer", () => {
     const rows = parseGrokUsage(
       [

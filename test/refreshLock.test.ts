@@ -2,6 +2,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -54,6 +55,19 @@ describe("refresh lock", () => {
 
     expect(winners).toHaveLength(1);
     await winners[0]();
+  });
+
+  it("treats a junction alias as the same workspace", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "usage-viewer-lock-alias-"));
+    const rootDir = join(parent, "workspace");
+    const alias = join(parent, "workspace-alias");
+    await mkdir(join(rootDir, "data"), { recursive: true });
+    await symlink(rootDir, alias, "junction");
+
+    const release = await tryAcquireRefreshLock(rootDir);
+    expect(release).toBeTypeOf("function");
+    await expect(tryAcquireRefreshLock(alias)).resolves.toBeUndefined();
+    await release?.();
   });
 });
 

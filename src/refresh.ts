@@ -5,7 +5,7 @@ import type {
   UsageProvider,
   UsageSnapshot,
 } from "./types";
-import { PROVIDER_ORDER, deriveStatus } from "./lib/usage";
+import { PROVIDER_ORDER } from "./lib/usage";
 import { loadConfig } from "./config";
 import { PROVIDER_COLLECTORS } from "./collectors";
 import { runPty } from "./collectors/pty";
@@ -17,8 +17,8 @@ import type {
 } from "./collectors/types";
 import {
   rawFileNameForProvider,
+  purgeRawOutputs,
   readSnapshot,
-  writeRawOutput,
   writeCompatibilityReport,
   writeSnapshot,
 } from "./storage";
@@ -81,6 +81,10 @@ async function runLockedRefresh(
 ): Promise<UsageSnapshot> {
   const config = await loadConfig(rootDir);
   const previous = await readSnapshot(rootDir);
+  // Older builds persisted broad CLI transcripts for diagnostics. Remove them
+  // before collecting and keep all new compatibility evidence in memory or in
+  // the narrowly redacted compatibility report.
+  await purgeRawOutputs(rootDir);
   const enabled = new Set(config.enabledProviders);
   const providersToRun = options.provider
     ? [options.provider]
@@ -103,11 +107,6 @@ async function runLockedRefresh(
       const result = enabled.has(provider)
         ? await runProviderCollector(provider, collectorMap[provider], context)
         : disabledResult(provider);
-      await writeRawOutput(
-        rootDir,
-        result.rawFileName,
-        result.cleanedText || result.error || "No collector output captured."
-      );
       return [provider, result] as const;
     })
   );
@@ -126,7 +125,12 @@ async function runLockedRefresh(
 
     if (result) {
       collectors.push(
-        healthFromResult(result, previousRows.length > 0, previousHealth)
+        healthFromResult(
+          result,
+          previousRows,
+          previousHealth,
+          enabled.has(provider)
+        )
       );
       limits.push(...rowsFromResult(result, previousRows));
       continue;
@@ -136,18 +140,21 @@ async function runLockedRefresh(
     // config. Surface it as unavailable (not its stale `ok` health) and drop its
     // old rows so it disappears from the dashboard instead of looking current.
     if (!options.provider && !enabled.has(provider)) {
-      collectors.push(healthFromResult(disabledResult(provider), false));
+      collectors.push(
+        healthFromResult(disabledResult(provider), [], previousHealth, false)
+      );
       continue;
     }
 
     if (previousHealth) {
-      collectors.push(previousHealth);
+      collectors.push({ ...previousHealth, enabled: enabled.has(provider) });
       limits.push(...previousRows);
       continue;
     }
 
     collectors.push({
       provider,
+      enabled: enabled.has(provider),
       ok: false,
       state: "stale",
       checkedAt: new Date().toISOString(),
@@ -158,6 +165,7 @@ async function runLockedRefresh(
 
   const snapshot = await writeSnapshot(rootDir, {
     generatedAt: new Date().toISOString(),
+    timezone: config.timezone,
     collectors,
     limits,
   });
@@ -229,13 +237,18 @@ function disabledResult(provider: UsageProvider): ProviderCollectorResult {
 
 function healthFromResult(
   result: ProviderCollectorResult,
-  hasPreviousRows: boolean,
-  previous?: CollectorHealth
+  previousRows: UsageLimit[],
+  previous: CollectorHealth | undefined,
+  enabled: boolean
 ): CollectorHealth {
+  const hasPreviousRows = previousRows.length > 0;
   const state: CollectorState =
     result.ok || !hasPreviousRows ? result.state : "stale";
+  const previousRowIds = actionableRowIds(previousRows);
+  const currentRowIds = actionableRowIds(result.limits);
   return {
     provider: result.provider,
+    enabled,
     ok: result.ok,
     state,
     attemptState: result.state,
@@ -247,6 +260,10 @@ function healthFromResult(
       previous?.formatFingerprint !== undefined &&
       result.formatFingerprint !== undefined &&
       previous.formatFingerprint !== result.formatFingerprint,
+    rowInventoryChanged:
+      result.ok && previousRowIds.length > 0
+        ? !sameStringArray(previousRowIds, currentRowIds)
+        : undefined,
     error:
       state === "stale" && result.error
         ? `Last refresh ${result.state}: ${result.error}`
@@ -254,11 +271,31 @@ function healthFromResult(
   };
 }
 
+function actionableRowIds(rows: UsageLimit[]): string[] {
+  return rows
+    .filter((row) => !row.informational)
+    .map((row) => row.id)
+    .sort();
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
 function rowsFromResult(
   result: ProviderCollectorResult,
   previousRows: UsageLimit[]
 ): UsageLimit[] {
-  if (result.ok) return result.limits;
+  if (result.ok) {
+    return result.limits.map((row) => ({
+      ...row,
+      freshness: "verified",
+      error: undefined,
+    }));
+  }
   if (previousRows.length === 0) return [];
   return previousRows.map((row) => markRowStale(row, result));
 }
@@ -269,7 +306,7 @@ function markRowStale(
 ): UsageLimit {
   return {
     ...row,
-    status: deriveStatus(row.usedPercent, row.remainingPercent),
+    freshness: "stale",
     statusLabel: buildStaleStatusLabel(row.statusLabel),
     error: result.error,
   };

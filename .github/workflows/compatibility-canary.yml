@@ -3,6 +3,13 @@ name: Provider Compatibility Canary
 on:
   schedule:
     - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      accept_baseline:
+        description: "Replace the protected baseline after an intentional adapter update"
+        required: false
+        type: boolean
+        default: false
 
 # Never run two PTY canaries against the same provider test profile at once.
 concurrency:
@@ -20,6 +27,10 @@ jobs:
     # test accounts. Never attach it to a developer workstation or personal
     # profile, and never store provider credentials in this repository.
     runs-on: [self-hosted, Windows, X64, usage-viewer-canary]
+    # Configure required reviewers only on `compatibility-canary`. Scheduled
+    # read-only comparisons use the unprotected environment so they never wait
+    # for a human every six hours.
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.accept_baseline && 'compatibility-canary' || 'compatibility-canary-readonly' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -71,8 +82,37 @@ jobs:
             if (-not $fullPath.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
               throw "Refusing to clean a path outside GITHUB_WORKSPACE: $fullPath"
             }
-            Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $fullPath) {
+              Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $fullPath) {
+              throw "Canary pre-run cleanup left runtime data behind: $fullPath"
+            }
           }
+
+      - name: Restore protected compatibility baseline
+        shell: pwsh
+        env:
+          ACCEPT_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.accept_baseline && 'true' || 'false' }}
+        run: |
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          if (-not $env:USAGE_VIEWER_CANARY_BASELINE) {
+            throw "Set USAGE_VIEWER_CANARY_BASELINE to a runner-owned path outside the checkout."
+          }
+          $baseline = [IO.Path]::GetFullPath($env:USAGE_VIEWER_CANARY_BASELINE)
+          if ($baseline.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "USAGE_VIEWER_CANARY_BASELINE must be outside the repository checkout."
+          }
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $baseline) | Out-Null
+          if ($env:ACCEPT_BASELINE -eq "true") {
+            Write-Host "Manual baseline acceptance requested; collecting without the previous baseline."
+            exit 0
+          }
+          if (-not (Test-Path -LiteralPath $baseline -PathType Leaf)) {
+            throw "No protected compatibility baseline exists. Run workflow_dispatch once with accept_baseline enabled."
+          }
+          New-Item -ItemType Directory -Force -Path (Join-Path $workspace "data") | Out-Null
+          Copy-Item -LiteralPath $baseline -Destination (Join-Path $workspace "data/usage-snapshot.json") -ErrorAction Stop
 
       - name: Install exact dependencies
         id: dependencies
@@ -85,6 +125,37 @@ jobs:
         continue-on-error: true
         run: npm run compatibility:check
 
+      - name: Persist successful protected baseline
+        id: baseline
+        if: steps.dependencies.outcome == 'success' && steps.canary.outcome == 'success'
+        shell: pwsh
+        run: |
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          $source = Join-Path $workspace "data/usage-snapshot.json"
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Compatibility check did not produce a snapshot baseline."
+          }
+          $baseline = [IO.Path]::GetFullPath($env:USAGE_VIEWER_CANARY_BASELINE)
+          if ($baseline.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to persist a baseline inside the repository checkout."
+          }
+          $temp = "$baseline.$env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT.tmp"
+          try {
+            Copy-Item -LiteralPath $source -Destination $temp -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $baseline) {
+              $backup = "$baseline.$env:GITHUB_RUN_ID.bak"
+              try {
+                [System.IO.File]::Replace($temp, $baseline, $backup, $true)
+              } finally {
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+              }
+            } else {
+              [System.IO.File]::Move($temp, $baseline)
+            }
+          } finally {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Create redacted compatibility artifact
         id: sanitize
         if: always()
@@ -92,6 +163,7 @@ jobs:
         env:
           DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
           CANARY_OUTCOME: ${{ steps.canary.outcome }}
+          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $outputDir = Join-Path $PWD ".canary-artifacts"
@@ -121,13 +193,15 @@ jobs:
                 adapterVersion = [string] $_.adapterVersion
                 formatFingerprint = [string] $_.formatFingerprint
                 formatChanged = [bool] $_.formatChanged
+                rowInventoryChanged = [bool] $_.rowInventoryChanged
               }
             })
           }
 
           $commandPassed =
             $env:DEPENDENCY_OUTCOME -eq "success" -and
-            $env:CANARY_OUTCOME -eq "success"
+            $env:CANARY_OUTCOME -eq "success" -and
+            $env:BASELINE_OUTCOME -eq "success"
           $reportPassed = $null -ne $source -and [bool] $source.passed
           $expectedProviders = @("claude", "codex", "agy", "grok")
           $actualProviders = @($providers | ForEach-Object { [string] $_.provider })
@@ -153,7 +227,7 @@ jobs:
       - name: Upload redacted compatibility report only
         id: report_upload
         if: always() && steps.sanitize.outcome == 'success'
-        # Never broaden this path to data/**: data/raw contains PTY transcripts.
+        # Never broaden this path to data/**: runtime snapshots are private.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: redacted-compatibility-report-${{ github.run_id }}-${{ github.run_attempt }}
@@ -167,9 +241,10 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          CANARY_FAILED: ${{ steps.dependencies.outcome != 'success' || steps.canary.outcome != 'success' || steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success' }}
+          CANARY_FAILED: ${{ steps.dependencies.outcome != 'success' || steps.canary.outcome != 'success' || steps.baseline.outcome != 'success' || steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success' }}
           DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
           CANARY_OUTCOME: ${{ steps.canary.outcome }}
+          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
@@ -245,6 +320,7 @@ jobs:
           - **Latest result:** $result
           - **Dependency install:** $env:DEPENDENCY_OUTCOME
           - **Compatibility command:** $env:CANARY_OUTCOME
+          - **Protected baseline:** $env:BASELINE_OUTCOME
           - **Commit:** ``$env:COMMIT_SHA``
           - **Run:** [Open workflow run]($env:RUN_URL)
 
@@ -252,7 +328,7 @@ jobs:
           | --- | --- | --- | ---: | --- |
           $($providerRows -join "`n")
 
-          The uploaded artifact is allow-list redacted. Raw PTY transcripts and provider credentials are never uploaded.
+          The uploaded artifact is allow-list redacted. Provider transcripts are not persisted or uploaded.
           "@
 
           if ($env:CANARY_FAILED -eq "true") {
@@ -320,10 +396,15 @@ jobs:
             if (-not $fullPath.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
               throw "Refusing to clean a path outside GITHUB_WORKSPACE: $fullPath"
             }
-            Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $fullPath) {
+              Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $fullPath) {
+              throw "Canary cleanup left runtime data behind: $fullPath"
+            }
           }
 
       - name: Fail after recording a canary failure
-        if: always() && (steps.dependencies.outcome != 'success' || steps.canary.outcome != 'success' || steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success')
+        if: always() && (steps.dependencies.outcome != 'success' || steps.canary.outcome != 'success' || steps.baseline.outcome != 'success' || steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success')
         shell: pwsh
         run: throw "Provider compatibility canary failed; the managed issue and redacted artifact were updated."

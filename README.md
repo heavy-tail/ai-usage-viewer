@@ -82,8 +82,9 @@ To collect once without opening the UI:
 npm run collect
 ```
 
-This writes `data/usage-snapshot.json` and privacy-filtered diagnostic output
-under `data/raw/`.
+This writes the privacy-filtered `data/usage-snapshot.json` and compatibility
+report. Full provider terminal transcripts are kept only in memory while a
+refresh runs; they are not persisted or exposed through the local API.
 
 The production server also runs a quiet compatibility refresh every six hours
 (override with `COMPATIBILITY_CHECK_INTERVAL_MINUTES`). Each successful result
@@ -100,9 +101,12 @@ For provider-side changes that happen without a repository commit,
 on a dedicated, labeled self-hosted Windows runner. Once that runner is
 provisioned with non-personal provider test accounts, drift automatically opens
 or updates one GitHub issue and recovery closes it. Only the redacted report is
-uploaded; raw CLI transcripts stay off GitHub and are removed from the runner
-workspace after each job. Personal OAuth sessions should never be copied into
-GitHub-hosted CI.
+uploaded; provider transcripts are never persisted, and runtime snapshots are
+removed from the runner workspace after each job. Personal OAuth sessions
+should never be copied into
+GitHub-hosted CI. The runner-owned baseline lives outside the checkout, and the
+`compatibility-canary` GitHub environment should require review before a manual
+baseline replacement can run.
 
 ## Desktop Shortcut
 
@@ -129,6 +133,7 @@ to choose providers and local defaults:
 - `codex.collectDefault`: collect account limits from the default Codex model
 - `agy.pinnedGroups`: optional filter for Antigravity model-group quota rows (e.g. `"Gemini Models"`); empty shows all
 - `grokCommand`: path to the native Grok CLI (defaults to `grok` on PATH; set an absolute path if it isn't on PATH)
+- `timezone`: IANA timezone used consistently for every displayed reset time
 - `planLabelFallback`: labels used when a provider does not expose plan text
 
 Machine-specific paths should stay in `config.json`; do not hardcode them in
@@ -140,12 +145,15 @@ Runtime data is local and ignored by git:
 
 - `data/usage-snapshot.json`
 - `data/compatibility-report.json`
-- `data/raw/*.txt`
 - `data/logs/*`
 
-Snapshot and raw-output writes pass through redaction helpers for email,
-organization, account, and session-like identifiers. Raw CLI output can still
-contain account metadata before redaction, so keep `data/` out of commits.
+Snapshot and compatibility-report writes pass through redaction helpers for
+email, organization, account, session, and credential-like identifiers. CLI
+output can contain account metadata while a collector is running, so the app
+caps it in memory and does not save or serve full transcripts. Keep `data/` out
+of commits. Each Windows pseudo-terminal capture runs in its own short-lived,
+hidden worker so native terminal handles are closed even if a provider exits
+unexpectedly.
 
 The app does not read token files, cookies, browser sessions, or private web
 APIs. It only launches local CLI commands and parses their visible usage output.
@@ -161,20 +169,21 @@ npm run build
 Expected coverage includes current and historical parser fixtures, completeness
 checks, collector behavior, refresh locking, snapshot shape, and redaction.
 
-Pull requests and pushes to `main` run an exact install, dependency audit,
-type-check, test, and production-build check on a Windows GitHub Actions runner
-with Node.js 24.
+Pull requests and pushes to `main` run an exact install, full dependency audit,
+type-check, tests, production build, and an extracted-bundle smoke test on a
+Windows GitHub Actions runner with Node.js 24. Pull requests receive no release
+credentials.
 
-After those checks pass, `main` and `v*` tag runs also upload a Windows/Node
-deployment bundle to the workflow run. A `v*` tag publishes the verified bundle
-in a GitHub Release. The bundle contains the built dashboard, local server
-source, and locked npm manifests; it still requires Windows, Node.js 24, and an
-`npm ci` after extraction. Release tags must match `package.json`, archives are
-reproducible and boot-smoke-tested, and an existing release asset is never
-silently replaced. It is not a portable installer or an automatic desktop
-updater yet. Release runs include a SHA-256 checksum and GitHub build
-provenance; verify a downloaded archive with `gh attestation verify <archive>
---repo heavy-tail/ai-usage-viewer` before installing it.
+After a `main` run passes, its exact tested commit is bundled and attested. A
+separate workflow loaded from the protected default branch verifies that commit
+is still current, creates the version tag from `package.json`, and publishes the
+same immutable ZIP and checksum through the protected `release` environment.
+Release logic is never loaded from a pushed tag. Bump `package.json` before the
+next release; existing tags and assets are never moved or replaced. The bundle
+contains the built dashboard, local server source, and locked npm manifests; it
+still requires Windows, Node.js 24, and an `npm ci` after extraction. It is not
+a portable installer or an automatic desktop updater yet. Verify a downloaded
+archive with `gh attestation verify <archive> --repo heavy-tail/ai-usage-viewer`.
 
 ## Known Limitations
 
@@ -182,7 +191,7 @@ provenance; verify a downloaded archive with `gh attestation verify <archive>
   new adapter release. The app detects incomplete/unknown sections, retains the
   last verified values, and records a redacted compatibility report instead of
   guessing or silently dropping rows.
-- Windows only — the collectors rely on Windows pseudo-consoles.
+- Windows only: the collectors rely on Windows pseudo-consoles.
 - Login, workspace trust, and update prompts can make provider collection
   unavailable or stale until handled locally.
 - History charts, SQLite persistence, packaged desktop apps, and browser

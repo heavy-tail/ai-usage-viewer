@@ -14,7 +14,7 @@ import {
   type RefreshService,
 } from "../refresh";
 import { isRefreshLockHeld } from "../refreshLock";
-import { readRawOutput, readSnapshot } from "../storage";
+import { readSnapshot } from "../storage";
 import { validateSnapshotShape } from "../snapshot";
 import type { UsageProvider } from "../types";
 
@@ -53,8 +53,9 @@ export function createUsageServer(options: UsageServerOptions): Server {
         json(res, 409, { error: error.message, refreshing: true });
         return;
       }
+      console.error("Usage API request failed:", error);
       json(res, 500, {
-        error: error instanceof Error ? error.message : String(error),
+        error: "The local usage service could not complete the request.",
       });
     }
   });
@@ -113,22 +114,6 @@ async function route(
     }
     const snapshot = await refresh.refresh({ rootDir, provider });
     json(res, 200, { snapshot, refreshing: false });
-    return;
-  }
-
-  const rawRoute = url.pathname.match(/^\/api\/raw\/([^/]+)$/);
-  if (method === "GET" && rawRoute) {
-    const provider = parseProvider(rawRoute[1]);
-    if (!provider) {
-      json(res, 404, { error: "Unknown provider." });
-      return;
-    }
-    const raw = await readRawOutput(rootDir, provider);
-    if (raw == null) {
-      json(res, 404, { error: "No raw output stored for provider." });
-      return;
-    }
-    text(res, 200, raw);
     return;
   }
 
@@ -236,9 +221,10 @@ function parseProvider(value: string): UsageProvider | undefined {
 // before a route reads local data or triggers a refresh. Requests with no Origin
 // (the local launch-refresh script, curl, tests) are allowed.
 function isLocalRequest(req: IncomingMessage): boolean {
-  if (!isLoopbackHost(req.headers.host)) return false;
+  const host = req.headers.host;
+  if (!isLoopbackHost(host) || !host) return false;
   const origin = req.headers.origin;
-  return origin === undefined || isLoopbackOrigin(origin);
+  return origin === undefined || isSameLoopbackOrigin(origin, host);
 }
 
 function isLoopbackHost(host: string | undefined): boolean {
@@ -247,9 +233,16 @@ function isLoopbackHost(host: string | undefined): boolean {
   return name === "127.0.0.1" || name === "localhost" || name === "::1";
 }
 
-function isLoopbackOrigin(origin: string): boolean {
+function isSameLoopbackOrigin(origin: string, host: string): boolean {
   try {
-    return isLoopbackHost(new URL(origin).host);
+    const parsed = new URL(origin);
+    return (
+      parsed.protocol === "http:" &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      isLoopbackHost(parsed.host) &&
+      parsed.host.toLowerCase() === host.toLowerCase()
+    );
   } catch {
     return false;
   }

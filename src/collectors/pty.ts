@@ -10,8 +10,10 @@ import {
   PtyTimeoutError,
   errorMessage,
 } from "./errors";
+import { runPtyIsolated } from "./ptyIsolated";
 
 const execFileAsync = promisify(execFile);
+const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
 // NOTE (C5): `waitFor` is matched against the ENTIRE accumulated output buffer,
 // not just newly-arrived bytes. If a step's pattern already appeared earlier in
@@ -45,6 +47,7 @@ export type RunPtyOptions = {
   rows?: number;
   steps: PtyStep[];
   totalTimeoutMs: number;
+  maxOutputBytes?: number;
   responders?: PtyResponder[];
 };
 
@@ -56,8 +59,17 @@ export type PtyRunResult = {
 
 export type PtyRunner = (options: RunPtyOptions) => Promise<PtyRunResult>;
 
-export const runPty: PtyRunner = async (options) => {
+export const runPtyInProcess: PtyRunner = async (options) => {
+  const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
+    throw new PtyProcessError(
+      "PTY maxOutputBytes must be a positive integer.",
+      "",
+      ""
+    );
+  }
   let rawOutput = "";
+  let outputLimitError: PtyProcessError | undefined;
   let exitCode: number | undefined;
   let exited = false;
   const commandSpec = resolvePtyCommand(options.command, options.args);
@@ -95,8 +107,26 @@ export const runPty: PtyRunner = async (options) => {
     for (const waiter of waiters) waiter();
   };
 
+  let rejectOutputLimit: (error: PtyProcessError) => void = () => undefined;
+  const outputLimit = new Promise<never>((_resolve, reject) => {
+    rejectOutputLimit = reject;
+  });
+
   terminal.onData((chunk) => {
-    rawOutput += chunk;
+    if (outputLimitError) return;
+    const combined = rawOutput + chunk;
+    if (Buffer.byteLength(combined, "utf8") > maxOutputBytes) {
+      rawOutput = truncateUtf8(combined, maxOutputBytes);
+      outputLimitError = new PtyProcessError(
+        `PTY output exceeded ${maxOutputBytes} bytes.`,
+        rawOutput,
+        cleanTerminalOutput(rawOutput)
+      );
+      rejectOutputLimit(outputLimitError);
+      notify();
+      return;
+    }
+    rawOutput = combined;
     if (responders) {
       for (const responder of responders) {
         if (responder.once && responder.used) continue;
@@ -162,14 +192,18 @@ export const runPty: PtyRunner = async (options) => {
     // requested step has completed, cleanup gets its own bounded waits below;
     // a slow ConPTY close must not turn verified provider output into a false
     // collection timeout.
-    await Promise.race([conversation, totalTimer]);
+    await Promise.race([conversation, totalTimer, outputLimit]);
     if (totalTimeout) {
       clearTimeout(totalTimeout);
       totalTimeout = undefined;
     }
 
     await waitForExit(() => exited, waiters, 1_000);
-    if (!exited) await teardownOnce();
+    // A naturally exited Windows shell still leaves the native ConPTY handle
+    // open until node-pty's kill path runs. Always finalize the terminal; the
+    // non-Windows branch below remains a no-op after a natural exit.
+    await teardownOnce();
+    if (outputLimitError) throw outputLimitError;
 
     return {
       rawOutput,
@@ -181,39 +215,49 @@ export const runPty: PtyRunner = async (options) => {
       clearTimeout(totalTimeout);
       totalTimeout = undefined;
     }
-    if (!exited) await teardownOnce();
+    await teardownOnce();
     throw error;
   } finally {
     if (totalTimeout) clearTimeout(totalTimeout);
   }
 };
 
+// node-pty 1.1 removes its native ConPTY handle record as soon as the shell
+// exits, before ClosePseudoConsole can run. A dedicated, hidden worker gives
+// every Windows capture an OS-enforced cleanup boundary: when the worker exits,
+// Windows closes any native handles even after provider crashes or natural
+// exits. Other platforms keep the lower-overhead in-process path.
+export const runPty: PtyRunner = (options) =>
+  process.platform === "win32"
+    ? runPtyIsolated(options)
+    : runPtyInProcess(options);
+
 async function terminatePty(
   terminal: nodePty.IPty,
   isExited: () => boolean,
   waiters: Set<() => void>
 ): Promise<void> {
-  if (isExited()) return;
-
   if (process.platform === "win32") {
     let taskkillSucceeded = false;
-    try {
-      // node-pty 1.1 asks a helper process to AttachConsole while killing a
-      // ConPTY tree. In windowless hosts that helper can throw even though the
-      // process is ultimately killed, which made tests and production logs look
-      // falsely healthy. taskkill performs the same bounded tree termination
-      // without requiring the parent process to own a Windows console.
-      await execFileAsync(
-        "taskkill.exe",
-        ["/pid", String(terminal.pid), "/T", "/F"],
-        { timeout: 3_000, windowsHide: true }
-      );
-      taskkillSucceeded = true;
-    } catch {
-      // The process may already have exited between the check and taskkill.
+    if (!isExited()) {
+      try {
+        // node-pty 1.1 asks a helper process to AttachConsole while killing a
+        // ConPTY tree. In windowless hosts that helper can throw even though the
+        // process is ultimately killed, which made tests and production logs look
+        // falsely healthy. taskkill performs the same bounded tree termination
+        // without requiring the parent process to own a Windows console.
+        await execFileAsync(
+          "taskkill.exe",
+          ["/pid", String(terminal.pid), "/T", "/F"],
+          { timeout: 3_000, windowsHide: true }
+        );
+        taskkillSucceeded = true;
+      } catch {
+        // The process may already have exited between the check and taskkill.
+      }
+      // node-pty 1.1 defers its ConPTY exit event while it flushes output.
+      await waitForExit(isExited, waiters, 2_500);
     }
-    // node-pty 1.1 defers its ConPTY exit event while it flushes output.
-    await waitForExit(isExited, waiters, 2_500);
     // A zero taskkill status or node-pty's own exit event verifies that the
     // process tree is gone. If neither happened, retain node-pty's normal
     // process-list cleanup instead of suppressing it speculatively.
@@ -232,6 +276,7 @@ async function terminatePty(
     return;
   }
 
+  if (isExited()) return;
   terminal.kill();
 }
 
@@ -371,4 +416,8 @@ function matches(text: string, pattern: RegExp | string): boolean {
 
 function patternLabel(pattern: RegExp | string): string {
   return typeof pattern === "string" ? JSON.stringify(pattern) : pattern.toString();
+}
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  return Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
 }

@@ -1,0 +1,125 @@
+name: Publish reviewed release
+
+# This workflow is loaded from the protected default branch. A pushed tag can
+# never provide or modify the privileged release logic.
+on:
+  workflow_run:
+    workflows: ["CI and Delivery"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reviewed-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish tested main commit
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Check out the exact tested commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tested commit is still main and select its tag
+        id: release
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          current_main="$(git rev-parse origin/main)"
+          if [[ "$TESTED_SHA" != "$current_main" ]]; then
+            echo "A newer main commit exists; the newer CI run owns release authority."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version="$(node -p "require('./package.json').version")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid package version: $version" >&2
+            exit 1
+          fi
+          tag="v$version"
+
+          remote_tag="$(git ls-remote --tags origin "refs/tags/$tag" | awk '{print $1}')"
+          if [[ -n "$remote_tag" && "$remote_tag" != "$TESTED_SHA" ]]; then
+            echo "Tag $tag already points at unreviewed commit $remote_tag." >&2
+            exit 1
+          fi
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download the bundle produced by that CI run
+        if: steps.release.outputs.publish == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          name: usage-viewer-windows-node-${{ github.event.workflow_run.run_number }}
+          path: release
+
+      - name: Create immutable tag and GitHub release
+        if: steps.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t checksum_files < <(find release -maxdepth 1 -type f -name '*.sha256' -print | sort)
+          mapfile -t archive_files < <(find release -maxdepth 1 -type f -name '*.zip' -print | sort)
+          if [[ ${#checksum_files[@]} -ne 1 || ${#archive_files[@]} -ne 1 ]]; then
+            echo "Expected exactly one ZIP and one checksum file." >&2
+            exit 1
+          fi
+
+          checksum_file="${checksum_files[0]}"
+          archive_file="${archive_files[0]}"
+          checksum_name="$(basename "$checksum_file")"
+          archive_name="$(basename "$archive_file")"
+          (cd release && sha256sum --check "$checksum_name")
+
+          remote_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')"
+          if [[ -z "$remote_tag" ]]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" \
+              -f sha="$TESTED_SHA" >/dev/null
+          elif [[ "$remote_tag" != "$TESTED_SHA" ]]; then
+            echo "Tag moved before release publication; refusing to publish." >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            published="$(mktemp -d)"
+            trap 'rm -rf "$published"' EXIT
+            gh release download "$RELEASE_TAG" \
+              --pattern "$checksum_name" \
+              --pattern "$archive_name" \
+              --dir "$published"
+            cmp -s "$checksum_file" "$published/$checksum_name"
+            (cd "$published" && sha256sum --check "$checksum_name")
+            echo "Release already exists with identical immutable assets."
+          else
+            gh release create "$RELEASE_TAG" "$archive_file" "$checksum_file" \
+              --verify-tag --generate-notes --title "AI Usage Viewer $RELEASE_TAG"
+          fi

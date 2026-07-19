@@ -428,7 +428,12 @@ async function requestQuota(
       );
     }
 
-    const rawText = await readBoundedBody(response, options.maxResponseBytes);
+    const rawText = await readBoundedBody(
+      response,
+      options.maxResponseBytes,
+      controller.signal
+    );
+    if (controller.signal.aborted) throw new RetryableRpcError();
     try {
       return { payload: JSON.parse(rawText) as unknown };
     } catch {
@@ -459,7 +464,8 @@ function isTransientStatus(status: number): boolean {
 
 async function readBoundedBody(
   response: Response,
-  maxResponseBytes: number
+  maxResponseBytes: number,
+  signal?: AbortSignal
 ): Promise<string> {
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
@@ -474,6 +480,15 @@ async function readBoundedBody(
   }
 
   const reader = response.body.getReader();
+  // Node's fetch aborts the request, but an already-open body reader has not
+  // always settled promptly under concurrent Windows test/process load. Tie
+  // cancellation directly to the reader so the per-request deadline remains
+  // authoritative after response headers arrive.
+  const cancelForAbort = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  if (signal?.aborted) cancelForAbort();
+  else signal?.addEventListener("abort", cancelForAbort, { once: true });
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
@@ -487,7 +502,9 @@ async function readBoundedBody(
       }
       chunks.push(part.value);
     }
+    if (signal?.aborted) throw new RetryableRpcError();
   } finally {
+    signal?.removeEventListener("abort", cancelForAbort);
     reader.releaseLock();
   }
 

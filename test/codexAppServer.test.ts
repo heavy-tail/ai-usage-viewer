@@ -98,6 +98,57 @@ describe("Codex app-server JSON-RPC client", () => {
     });
     expect(child.kill).toHaveBeenCalledOnce();
   });
+
+  it("rejects and terminates an app-server that exceeds its output limit", async () => {
+    const child = new FakeChildProcess();
+    readJsonLines(child.stdin, (message) => {
+      if (message.method === "initialize") {
+        child.stdout.write("x".repeat(512));
+      }
+    });
+
+    await expect(
+      readCodexAppServerRateLimits({
+        cwd: process.cwd(),
+        timeoutMs: 500,
+        maxOutputBytes: 256,
+        spawnProcess: (() =>
+          child as unknown as ChildProcessWithoutNullStreams) as CodexAppServerSpawn,
+      })
+    ).rejects.toMatchObject<CodexAppServerError>({
+      name: "CodexAppServerError",
+      message: "Codex app-server output exceeded 256 bytes.",
+    });
+    expect(child.kill).toHaveBeenCalledOnce();
+  });
+
+  it("does not resolve until process cleanup is confirmed", async () => {
+    const child = new FakeChildProcess();
+    const payload = rateLimitPayload();
+    let cleanupFinished = false;
+    readJsonLines(child.stdin, (message) => {
+      if (message.method === "initialize") {
+        child.stdout.write('{"id":1,"result":{}}\n');
+      }
+      if (message.method === "account/rateLimits/read") {
+        child.stdout.write(`${JSON.stringify({ id: 2, result: payload })}\n`);
+      }
+    });
+
+    const result = await readCodexAppServerRateLimits({
+      cwd: process.cwd(),
+      spawnProcess: (() =>
+        child as unknown as ChildProcessWithoutNullStreams) as CodexAppServerSpawn,
+      terminateProcess: async (process) => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        process.kill();
+        cleanupFinished = true;
+      },
+    });
+
+    expect(result.payload).toEqual(payload);
+    expect(cleanupFinished).toBe(true);
+  });
 });
 
 describe("Codex structured rate-limit parser", () => {
@@ -185,6 +236,24 @@ describe("Codex structured rate-limit parser", () => {
     ).toThrow(ParserDriftError);
   });
 
+  it("rejects millisecond reset timestamps where epoch seconds are required", () => {
+    expect(() =>
+      parseCodexAppServerRateLimits(
+        {
+          rateLimits: {
+            limitId: "codex",
+            primary: {
+              usedPercent: 25,
+              windowDurationMins: 300,
+              resetsAt: 1_730_947_200_000,
+            },
+          },
+        },
+        meta
+      )
+    ).toThrow(ParserDriftError);
+  });
+
   it("rejects a newly added percentage window instead of silently omitting it", () => {
     const payload = rateLimitPayload();
     const buckets = payload.rateLimitsByLimitId as Record<
@@ -226,6 +295,90 @@ describe("Codex structured rate-limit parser", () => {
     expect(() => parseCodexAppServerRateLimits(payload, meta)).toThrow(
       ParserDriftError
     );
+  });
+
+  it("surfaces a hard stop even when the percentage gauge is low", () => {
+    const limits = parseCodexAppServerRateLimits(
+      {
+        rateLimits: {
+          limitId: "codex",
+          primary: {
+            usedPercent: 12,
+            windowDurationMins: 300,
+            resetsAt: null,
+          },
+          secondary: null,
+          rateLimitReachedType: "workspace_member_usage_limit_reached",
+        },
+        rateLimitsByLimitId: null,
+      },
+      meta
+    );
+
+    expect(limits[0]).toMatchObject({
+      usedPercent: 12,
+      status: "exhausted",
+      blockingReason: "Workspace usage limit reached",
+    });
+  });
+
+  it("supports the forward-compatible spend-control hard stop", () => {
+    const limits = parseCodexAppServerRateLimits(
+      {
+        rateLimits: {
+          limitId: "codex",
+          primary: { usedPercent: 1, windowDurationMins: 300 },
+        },
+        spendControlReached: true,
+      },
+      meta
+    );
+
+    expect(limits[0]).toMatchObject({
+      status: "exhausted",
+      blockingReason: "Workspace spending limit reached",
+    });
+  });
+
+  it("fails closed on unknown hard-stop values and non-usage fields", () => {
+    expect(() =>
+      parseCodexAppServerRateLimits(
+        {
+          rateLimits: {
+            limitId: "codex",
+            primary: { usedPercent: 10, windowDurationMins: 300 },
+            rateLimitReachedType: "new_unknown_reason",
+          },
+        },
+        meta
+      )
+    ).toThrow(ParserDriftError);
+
+    expect(() =>
+      parseCodexAppServerRateLimits(
+        {
+          rateLimits: {
+            limitId: "codex",
+            primary: { usedPercent: 10, windowDurationMins: 300 },
+          },
+          spendControlReached: "yes",
+        },
+        meta
+      )
+    ).toThrow(ParserDriftError);
+
+    expect(() =>
+      parseCodexAppServerRateLimits(
+        {
+          rateLimits: {
+            limitId: "codex",
+            primary: { usedPercent: 10, windowDurationMins: 300 },
+            undocumentedFlag: false,
+          },
+        },
+        meta
+      )
+    ).toThrow(ParserDriftError);
   });
 });
 

@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { UsageProvider, UsageSnapshot } from "./types";
-import { mockSnapshot } from "./mockData";
 import {
   ApiError,
   getSnapshot,
@@ -46,6 +45,7 @@ export function App() {
         // keep polling until it clears or we hit the attempt cap.
       }
     }
+    throw new Error("Refresh verification timed out.");
   }, []);
 
   const refreshAll = useCallback(async () => {
@@ -61,7 +61,14 @@ export function App() {
         // Another browser, the background monitor, or a command-line canary is
         // already refreshing. Follow that run quietly and show its verified
         // result when the shared lock clears.
-        await pollUntilIdle();
+        try {
+          await pollUntilIdle();
+        } catch (pollError) {
+          setError(messageOf(pollError));
+          setConnection((current) =>
+            current === "live" ? current : "offline"
+          );
+        }
       } else {
         setError(messageOf(err));
         setConnection((c) => (c === "live" ? c : "offline"));
@@ -92,7 +99,7 @@ export function App() {
         }
       } catch (err) {
         if (controller.signal.aborted) return;
-        setSnapshot(mockSnapshot);
+        setSnapshot(emptyUsageSnapshot());
         setConnection("offline");
         setError(messageOf(err));
       }
@@ -110,7 +117,14 @@ export function App() {
         setConnection("live");
       } catch (err) {
         if (err instanceof ApiError && err.status === 409) {
-          await pollUntilIdle();
+          try {
+            await pollUntilIdle();
+          } catch (pollError) {
+            setError(messageOf(pollError));
+            setConnection((current) =>
+              current === "live" ? current : "offline"
+            );
+          }
         } else {
           setError(messageOf(err));
           setConnection((c) => (c === "live" ? c : "offline"));
@@ -181,12 +195,20 @@ export function App() {
                 queuedProviders.includes(p)
               }
               onRefresh={() => refreshProvider(p)}
+              timeZone={snapshot.timezone}
             />
           ))}
         </div>
-        {visibleProviders.length === 0 && connection === "live" && (
+        {visibleProviders.length === 0 &&
+          connection === "live" &&
+          refreshing != null && (
+            <div className="notice">Checking enabled providers…</div>
+          )}
+        {visibleProviders.length === 0 &&
+          connection === "live" &&
+          refreshing == null && (
           <div className="notice">
-            No logged-in CLI usage was detected on this machine yet.
+            No usage providers are enabled.
           </div>
         )}
       </main>
@@ -207,13 +229,18 @@ function ConnectionNotice({
   if (connection === "offline") {
     return (
       <div className="notice notice-warn">
-        Showing <strong>mock data</strong> — couldn't reach the collector API
-        {error ? ` (${error})` : ""}. Start it with <code>npm run api</code>.
+        Usage is temporarily unavailable because the local service could not be
+        reached. No sample values are being shown.
       </div>
     );
   }
   if (error) {
-    return <div className="notice notice-warn">Refresh failed: {error}</div>;
+    return (
+      <div className="notice notice-warn">
+        Couldn&apos;t update usage. Any displayed values are the last verified
+        ones.
+      </div>
+    );
   }
   return null;
 }

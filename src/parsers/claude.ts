@@ -38,6 +38,18 @@ type ClaudeSectionState =
 
 export function parseClaudeUsage(text: string, meta: ParserMeta): UsageLimit[] {
   const sections = findClaudeSections(text);
+  const semanticLabelById = new Map<string, string>();
+  for (const section of sections) {
+    const semanticLabel = normalizeSemanticLabel(section.scope);
+    const previousLabel = semanticLabelById.get(section.id);
+    if (previousLabel !== undefined && previousLabel !== semanticLabel) {
+      throw new ParserDriftError(
+        `Claude usage sections produced a colliding row id "${section.id}".`,
+        text
+      );
+    }
+    semanticLabelById.set(section.id, semanticLabel);
+  }
   const claimedPercentOffsets = new Set<number>();
   const latestById = new Map<string, ClaudeSectionState>();
 
@@ -159,7 +171,9 @@ function findClaudeSections(text: string): ClaudeSection[] {
         id: "claude:session",
         scope: "Current session",
         window: "session",
-        requiredReset: true,
+        // Current Claude builds no longer render a reset line for this row.
+        // Weekly all-model usage still requires one below.
+        requiredReset: false,
         start: match.index,
       };
     }
@@ -203,4 +217,8 @@ function allMatches(text: string, pattern: RegExp): RegExpExecArray[] {
   const matches = [...text.matchAll(pattern)];
   pattern.lastIndex = 0;
   return matches;
+}
+
+function normalizeSemanticLabel(value: string): string {
+  return value.trim().toLocaleLowerCase("en-US").replace(/\s+/g, " ");
 }

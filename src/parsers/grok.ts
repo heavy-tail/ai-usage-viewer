@@ -137,8 +137,12 @@ function normalizeLimitLabel(value: string): string {
 
 function resetAfter(text: string, match: RegExpMatchArray): string | undefined {
   if (match.index === undefined) return undefined;
-  return text
-    .slice(match.index + match[0].length)
+  const trailing = text.slice(match.index + match[0].length);
+  LIMIT_PERCENT_RE.lastIndex = 0;
+  const nextLimit = LIMIT_PERCENT_RE.exec(trailing);
+  LIMIT_PERCENT_RE.lastIndex = 0;
+  const section = trailing.slice(0, nextLimit?.index ?? trailing.length);
+  return section
     .match(RESET_RE)?.[1]
     ?.replace(/\s+/g, " ")
     .trim();

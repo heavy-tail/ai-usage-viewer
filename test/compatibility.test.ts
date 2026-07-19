@@ -14,7 +14,7 @@ describe("provider adapter contract", () => {
     expect(result).toMatchObject({
       ok: true,
       state: "ok",
-      adapterVersion: "2.1.0",
+      adapterVersion: "2.2.0",
     });
     expect(result.formatFingerprint).toMatch(/^[a-f0-9]{16}$/);
   });
@@ -86,6 +86,19 @@ describe("provider adapter contract", () => {
     );
 
     expect(first).toBe(second);
+  });
+
+  it("fingerprints JSON structure independently of values and key order", () => {
+    const first = fingerprintFormat('{"usage":10,"account":{"name":"alpha"}}');
+    const reordered = fingerprintFormat(
+      '{"account":{"name":"beta"},"usage":90}'
+    );
+    const changed = fingerprintFormat(
+      '{"account":{"name":"beta"},"usage":90,"newWindow":true}'
+    );
+
+    expect(first).toBe(reordered);
+    expect(changed).not.toBe(first);
   });
 });
 

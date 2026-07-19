@@ -24,7 +24,21 @@ export default defineConfig({
       ],
     },
     proxy: {
-      "/api": "http://127.0.0.1:4317",
+      "/api": {
+        target: "http://127.0.0.1:4317",
+        changeOrigin: true,
+        configure(proxy) {
+          // Production accepts only its exact browser origin. In development,
+          // Vite is the trusted same-machine reverse proxy, so normalize the
+          // forwarded Origin to the backend origin instead of weakening the
+          // production server's check to accept arbitrary loopback ports.
+          proxy.on("proxyReq", (request) => {
+            if (request.getHeader("origin")) {
+              request.setHeader("origin", "http://127.0.0.1:4317");
+            }
+          });
+        },
+      },
     },
   },
 });

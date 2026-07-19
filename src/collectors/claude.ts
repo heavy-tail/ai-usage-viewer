@@ -9,6 +9,9 @@ import { isCommandAvailable } from "./command";
 import { failedResult, okResult } from "./helpers";
 import type { CollectorContext, ProviderCollectorResult } from "./types";
 
+const CACHED_USAGE_RE =
+  /Showing last-known usage\b[\s\S]{0,160}\bcould not refresh\b/i;
+
 export async function collectClaude(
   context: CollectorContext
 ): Promise<ProviderCollectorResult> {
@@ -70,6 +73,18 @@ export async function collectClaude(
         { send: "/exit\r", delayMs: 100 },
       ],
     });
+
+    // Claude can render structurally valid percentages while explicitly saying
+    // they are cached because its own refresh failed. Never relabel those rows
+    // as newly verified; the refresh layer will retain the prior verified
+    // snapshot and mark it stale instead.
+    if (CACHED_USAGE_RE.test(pty.cleanedOutput)) {
+      throw new CollectorUnavailableError(
+        "Claude CLI could not refresh its usage data.",
+        pty.rawOutput,
+        pty.cleanedOutput
+      );
+    }
 
     const meta = {
       checkedAt,

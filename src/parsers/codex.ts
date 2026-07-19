@@ -49,8 +49,15 @@ type StructuredBucket = {
   secondary?: StructuredWindow;
   individualLimit?: StructuredIndividualLimit;
   planType?: string;
-  rateLimitReachedType?: string;
+  rateLimitReachedType?: CodexRateLimitReachedType;
 };
+
+type CodexRateLimitReachedType =
+  | "rate_limit_reached"
+  | "workspace_owner_credits_depleted"
+  | "workspace_member_credits_depleted"
+  | "workspace_owner_usage_limit_reached"
+  | "workspace_member_usage_limit_reached";
 
 type WindowDescriptor = {
   id: string;
@@ -68,11 +75,19 @@ const STRUCTURED_BUCKET_FIELDS = new Set([
   "planType",
   "rateLimitReachedType",
 ]);
+const RATE_LIMIT_REACHED_TYPES = new Set<CodexRateLimitReachedType>([
+  "rate_limit_reached",
+  "workspace_owner_credits_depleted",
+  "workspace_member_credits_depleted",
+  "workspace_owner_usage_limit_reached",
+  "workspace_member_usage_limit_reached",
+]);
 const STRUCTURED_ROOT_FIELDS = new Set([
   "rateLimits",
   "rateLimitsByLimitId",
   "rateLimitResetCredits",
   "planType",
+  "spendControlReached",
 ]);
 const STRUCTURED_WINDOW_FIELDS = new Set([
   "usedPercent",
@@ -90,6 +105,8 @@ const STRUCTURED_CREDITS_FIELDS = new Set([
   "unlimited",
   "balance",
 ]);
+const MIN_PLAUSIBLE_EPOCH_SECONDS = 946_684_800; // 2000-01-01
+const MAX_PLAUSIBLE_EPOCH_SECONDS = 4_102_444_800; // 2100-01-01
 
 /** Parse the stable app-server account/rateLimits/read result. */
 export function parseCodexAppServerRateLimits(
@@ -111,6 +128,11 @@ export function parseCodexAppServerRateLimits(
   if (containsUsagePercent(root.rateLimitResetCredits)) {
     drift("Codex app-server reset-credit metadata contained usage percentages.");
   }
+  const spendControlReached = optionalBoolean(
+    root.spendControlReached,
+    "result spendControlReached",
+    drift
+  );
 
   const rawMultiBucket = root.rateLimitsByLimitId;
   const multiBucket = objectValue(rawMultiBucket);
@@ -167,13 +189,14 @@ export function parseCodexAppServerRateLimits(
           role,
           ...window,
           rateLimitReachedType: bucket.rateLimitReachedType ?? null,
+          spendControlReached: spendControlReached ?? null,
         },
         null,
         2
       );
 
       limits.push(
-        applyReachedStatus(
+        applyHardStop(
           limitFromUsed({
             id,
             provider: "codex",
@@ -189,7 +212,8 @@ export function parseCodexAppServerRateLimits(
             sourceText,
             meta: bucketMeta,
           }),
-          bucket.rateLimitReachedType
+          bucket,
+          spendControlReached
         )
       );
     }
@@ -206,12 +230,13 @@ export function parseCodexAppServerRateLimits(
           limitName: limitName ?? null,
           individualLimit: individual,
           rateLimitReachedType: bucket.rateLimitReachedType ?? null,
+          spendControlReached: spendControlReached ?? null,
         },
         null,
         2
       );
       limits.push(
-        applyReachedStatus(
+        applyHardStop(
           limitFromRemaining({
             id: uniqueId(baseId, "individual", ids),
             provider: "codex",
@@ -227,7 +252,8 @@ export function parseCodexAppServerRateLimits(
             sourceText,
             meta: bucketMeta,
           }),
-          bucket.rateLimitReachedType
+          bucket,
+          spendControlReached
         )
       );
     }
@@ -460,7 +486,7 @@ function parseStructuredBucket(
     `bucket "${mapKey}" planType`,
     drift
   );
-  const rateLimitReachedType = optionalString(
+  const rateLimitReachedType = optionalRateLimitReachedType(
     record.rateLimitReachedType,
     `bucket "${mapKey}" rateLimitReachedType`,
     drift
@@ -502,7 +528,7 @@ function parseStructuredWindow(
       `${path}.windowDurationMins`,
       drift
     ),
-    resetsAt: optionalPositiveInteger(record.resetsAt, `${path}.resetsAt`, drift),
+    resetsAt: optionalEpochSeconds(record.resetsAt, `${path}.resetsAt`, drift),
   };
 }
 
@@ -520,7 +546,7 @@ function parseStructuredIndividualLimit(
   if (!limit || !used) {
     drift(`Codex app-server ${path} had invalid limit/used values.`);
   }
-  const resetsAt = optionalPositiveInteger(record.resetsAt, `${path}.resetsAt`, drift);
+  const resetsAt = optionalEpochSeconds(record.resetsAt, `${path}.resetsAt`, drift);
   if (resetsAt == null) {
     drift(`Codex app-server ${path}.resetsAt was missing.`);
   }
@@ -589,6 +615,22 @@ function optionalPositiveInteger(
   return value;
 }
 
+function optionalEpochSeconds(
+  value: unknown,
+  path: string,
+  drift: (message: string) => never
+): number | undefined {
+  const parsed = optionalPositiveInteger(value, path, drift);
+  if (parsed == null) return undefined;
+  if (
+    parsed < MIN_PLAUSIBLE_EPOCH_SECONDS ||
+    parsed > MAX_PLAUSIBLE_EPOCH_SECONDS
+  ) {
+    drift(`Codex app-server ${path} was not a plausible epoch-seconds value.`);
+  }
+  return parsed;
+}
+
 function optionalString(
   value: unknown,
   path: string,
@@ -598,6 +640,31 @@ function optionalString(
   const parsed = stringValue(value);
   if (!parsed) drift(`Codex app-server ${path} was not a non-empty string.`);
   return parsed;
+}
+
+function optionalRateLimitReachedType(
+  value: unknown,
+  path: string,
+  drift: (message: string) => never
+): CodexRateLimitReachedType | undefined {
+  if (value == null) return undefined;
+  const parsed = stringValue(value);
+  if (!parsed || !RATE_LIMIT_REACHED_TYPES.has(parsed as CodexRateLimitReachedType)) {
+    drift(`Codex app-server ${path} was not a recognized enum value.`);
+  }
+  return parsed as CodexRateLimitReachedType;
+}
+
+function optionalBoolean(
+  value: unknown,
+  path: string,
+  drift: (message: string) => never
+): boolean | undefined {
+  if (value == null) return undefined;
+  if (typeof value !== "boolean") {
+    drift(`Codex app-server ${path} was not a boolean.`);
+  }
+  return value;
 }
 
 function describeWindow(
@@ -653,11 +720,38 @@ function resetAt(value?: number): string | undefined {
   return Number.isNaN(date.valueOf()) ? undefined : date.toISOString();
 }
 
-function applyReachedStatus(
+function applyHardStop(
   limit: UsageLimit,
-  rateLimitReachedType?: string
+  bucket: StructuredBucket,
+  spendControlReached: boolean | undefined
 ): UsageLimit {
-  return rateLimitReachedType ? { ...limit, status: "exhausted" } : limit;
+  const blockingReason = hardStopReason(
+    bucket.rateLimitReachedType,
+    spendControlReached
+  );
+  return blockingReason
+    ? { ...limit, status: "exhausted", blockingReason }
+    : limit;
+}
+
+function hardStopReason(
+  rateLimitReachedType: CodexRateLimitReachedType | undefined,
+  spendControlReached: boolean | undefined
+): string | undefined {
+  switch (rateLimitReachedType) {
+    case "rate_limit_reached":
+      return "Rate limit reached";
+    case "workspace_owner_credits_depleted":
+    case "workspace_member_credits_depleted":
+      return "Workspace credits depleted";
+    case "workspace_owner_usage_limit_reached":
+    case "workspace_member_usage_limit_reached":
+      return "Workspace usage limit reached";
+    default:
+      return spendControlReached
+        ? "Workspace spending limit reached"
+        : undefined;
+  }
 }
 
 function uniqueId(
@@ -696,11 +790,8 @@ function rejectUnknownUsageFields(
   path: string,
   drift: (message: string) => never
 ): void {
-  for (const [field, nested] of Object.entries(record)) {
-    if (
-      !allowed.has(field) &&
-      (/percent/i.test(field) || containsUsagePercent(nested))
-    ) {
+  for (const field of Object.keys(record)) {
+    if (!allowed.has(field)) {
       drift(
         `Codex app-server ${path} contained an unrecognized usage field "${field}".`
       );

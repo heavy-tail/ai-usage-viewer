@@ -4,6 +4,7 @@ import { shQuote } from "./shell";
 import type { CommandRunner } from "./types";
 
 const execFileAsync = promisify(execFile);
+const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 
 export const runCommand: CommandRunner = async (command, args, options) => {
   try {
@@ -11,6 +12,8 @@ export const runCommand: CommandRunner = async (command, args, options) => {
       cwd: options.cwd,
       timeout: options.timeoutMs,
       windowsHide: true,
+      encoding: "utf8",
+      maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
     });
     return {
       stdout: result.stdout ?? "",

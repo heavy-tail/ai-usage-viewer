@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
@@ -47,5 +47,17 @@ describe("loadConfig", () => {
     const rootDir = await workspace();
     await writeConfig(rootDir, '{ "enabledProviders": ["claude" ');
     await expect(loadConfig(rootDir)).rejects.toThrow(/valid JSON/i);
+  });
+
+  it("rejects invalid timezones instead of silently ignoring them", async () => {
+    const rootDir = await workspace();
+    await writeConfig(rootDir, { timezone: "Mars/Olympus_Mons" });
+    await expect(loadConfig(rootDir)).rejects.toThrow(/timezone.*invalid/i);
+  });
+
+  it("does not treat config read failures as a missing file", async () => {
+    const rootDir = await workspace();
+    await mkdir(join(rootDir, "config.json"));
+    await expect(loadConfig(rootDir)).rejects.toThrow(/Unable to read/i);
   });
 });

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import {
+  purgeRawOutputs,
   readSnapshot,
   writeCompatibilityReport,
   writeSnapshot,
@@ -139,5 +140,20 @@ describe("storage.writeCompatibilityReport", () => {
     expect(stored.diagnostics.accountLabel).toBe("<redacted-account-id>");
     expect(text).not.toContain("privateuser");
     expect(text).not.toContain("Private Claude Organization");
+  });
+});
+
+describe("storage.purgeRawOutputs", () => {
+  it("removes transcripts left by older versions", async () => {
+    const rootDir = await workspace();
+    const rawDir = join(rootDir, "data", "raw");
+    await mkdir(rawDir, { recursive: true });
+    await writeFile(join(rawDir, "claude.txt"), "legacy transcript", "utf8");
+
+    await purgeRawOutputs(rootDir);
+
+    await expect(readFile(join(rawDir, "claude.txt"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 });

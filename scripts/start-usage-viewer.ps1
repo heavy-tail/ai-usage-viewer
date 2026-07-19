@@ -5,6 +5,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Some desktop hosts pass both `Path` and `PATH` in the process environment.
+# Windows treats those names as equivalent, but Windows PowerShell's
+# Start-Process rejects the duplicate environment block. Preserve the effective
+# search path and publish one canonical entry before starting hidden children.
+$EffectivePath = [Environment]::GetEnvironmentVariable("PATH", "Process")
+if (-not [string]::IsNullOrWhiteSpace($EffectivePath)) {
+  [Environment]::SetEnvironmentVariable("Path", $null, "Process")
+  [Environment]::SetEnvironmentVariable("PATH", $null, "Process")
+  [Environment]::SetEnvironmentVariable("Path", $EffectivePath, "Process")
+}
+
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $ApiUrl = "http://127.0.0.1:4317/api/snapshot"
 $IdentityUrl = "http://127.0.0.1:4317/api/identity"
@@ -136,25 +147,6 @@ function Get-ServerIdentity {
       pid = [int]$identity.pid
       processStartedAtUtc = $startedAt.ToString("o")
     }
-  } catch {
-    return $null
-  }
-}
-
-function Get-VerifiedIdentityProcess {
-  param([object] $Identity)
-
-  if (-not $Identity) {
-    return $null
-  }
-  try {
-    $serverProcess = Get-Process -Id ([int]$Identity.pid) -ErrorAction Stop
-    $reportedStart = [DateTime]::Parse([string]$Identity.processStartedAtUtc).ToUniversalTime()
-    $actualStart = $serverProcess.StartTime.ToUniversalTime()
-    if ([Math]::Abs(($actualStart - $reportedStart).TotalSeconds) -gt 5) {
-      return $null
-    }
-    return $serverProcess
   } catch {
     return $null
   }
@@ -540,13 +532,58 @@ function Get-HealthyManagedIdentity {
   param([string] $BackendFingerprint)
 
   $identity = Get-ServerIdentity
+  $verifiedListener = $null
+  if ($identity) {
+    $verifiedListener = Get-VerifiedViewerListenerProcess `
+      -ExpectedProcessId ([int]$identity.pid) `
+      -ExpectedStartedAtUtc ([string]$identity.processStartedAtUtc)
+  }
   if (-not $identity -or
       [string]$identity.sourceFingerprint -ne $BackendFingerprint -or
-      -not (Get-VerifiedIdentityProcess -Identity $identity) -or
+      -not $verifiedListener -or
       -not (Test-HttpOk -Url $AppUrl -MustContain 'id="root"')) {
     return $null
   }
   return $identity
+}
+
+function Stop-FailedSpawnedServer {
+  param([object] $LauncherProcess)
+
+  $cleanupFailures = @()
+  if ($LauncherProcess) {
+    try {
+      $LauncherProcess.Refresh()
+      if (-not $LauncherProcess.HasExited) {
+        # This is the exact process handle returned by Start-Process in this
+        # launcher invocation, so its tree is safe to revoke on startup error.
+        $taskkillPath = Join-Path $env:SystemRoot "System32\taskkill.exe"
+        & $taskkillPath /pid ([int]$LauncherProcess.Id) /T /F | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          $cleanupFailures += "the newly spawned npm process tree did not stop"
+        }
+      }
+    } catch {
+      $cleanupFailures += "the newly spawned npm process tree could not be inspected"
+    }
+  }
+
+  # npm can exit after spawning Node. If a listener survived, terminate it only
+  # after the same repository-command and listener-ownership proof used during
+  # normal upgrades.
+  $listener = Get-VerifiedViewerListenerProcess
+  if ($listener) {
+    try {
+      Stop-VerifiedServerProcess -Process $listener
+    } catch {
+      $cleanupFailures += "the verified listener did not stop"
+    }
+  }
+  Remove-Item -LiteralPath $ServerStatePath -Force -ErrorAction SilentlyContinue
+
+  if ($cleanupFailures.Count -gt 0) {
+    throw "Startup cleanup failed: $($cleanupFailures -join '; ')."
+  }
 }
 
 function Wait-ForSpawnedServer {
@@ -743,7 +780,9 @@ try {
   $identity = Get-ServerIdentity
 
   if ($identity) {
-    $identityProcess = Get-VerifiedIdentityProcess -Identity $identity
+    $identityProcess = Get-VerifiedViewerListenerProcess `
+      -ExpectedProcessId ([int]$identity.pid) `
+      -ExpectedStartedAtUtc ([string]$identity.processStartedAtUtc)
     if (-not $identityProcess) {
       throw "Port 4317 claimed to be AI Usage Viewer, but its process identity could not be verified. It was left untouched."
     }
@@ -780,9 +819,19 @@ try {
 
   if (-not $ServerAvailable) {
     $ServerProcess = Start-ManagedServer -BackendFingerprint $BackendFingerprint
-    $stableIdentity = Wait-ForSpawnedServer `
-      -LauncherProcess $ServerProcess `
-      -BackendFingerprint $BackendFingerprint
+    try {
+      $stableIdentity = Wait-ForSpawnedServer `
+        -LauncherProcess $ServerProcess `
+        -BackendFingerprint $BackendFingerprint
+    } catch {
+      $startupError = $_
+      try {
+        Stop-FailedSpawnedServer -LauncherProcess $ServerProcess
+      } catch {
+        throw "AI Usage Viewer startup failed and its cleanup could not be confirmed. $($_.Exception.Message)"
+      }
+      throw $startupError
+    }
     Save-ManagedServerState `
       -Identity $stableIdentity `
       -BackendFingerprint $BackendFingerprint

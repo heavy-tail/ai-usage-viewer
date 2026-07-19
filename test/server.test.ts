@@ -186,7 +186,7 @@ describe("usage server routes", () => {
     });
   });
 
-  it("serves stored raw output and 404s when missing", async () => {
+  it("does not expose legacy raw collector transcripts", async () => {
     const rootDir = await workspace();
     await writeFile(
       join(rootDir, "data", "raw", "claude.txt"),
@@ -195,8 +195,8 @@ describe("usage server routes", () => {
     );
     await withServer({ rootDir, refresh: okRefresh }, async (base) => {
       const present = await fetch(`${base}/api/raw/claude`);
-      expect(present.status).toBe(200);
-      expect(await present.text()).toContain("hello raw");
+      expect(present.status).toBe(404);
+      expect(await present.text()).not.toContain("hello raw");
 
       const missing = await fetch(`${base}/api/raw/grok`);
       expect(missing.status).toBe(404);
@@ -254,7 +254,7 @@ describe("usage server routes", () => {
     });
   });
 
-  it("allows requests from a loopback Origin", async () => {
+  it("allows requests only from the exact dashboard origin", async () => {
     const rootDir = await workspace();
     await writeFile(
       join(rootDir, "data", "usage-snapshot.json"),
@@ -263,9 +263,19 @@ describe("usage server routes", () => {
     );
     await withServer({ rootDir, refresh: okRefresh }, async (base) => {
       const status = await rawRequest(base, "/api/snapshot", {
-        headers: { Origin: "http://localhost:5173" },
+        headers: { Origin: base },
       });
       expect(status).toBe(200);
+
+      const otherPort = await rawRequest(base, "/api/snapshot", {
+        headers: { Origin: "http://127.0.0.1:5173" },
+      });
+      expect(otherPort).toBe(403);
+
+      const otherLoopbackName = await rawRequest(base, "/api/snapshot", {
+        headers: { Origin: `http://localhost:${new URL(base).port}` },
+      });
+      expect(otherLoopbackName).toBe(403);
     });
   });
 

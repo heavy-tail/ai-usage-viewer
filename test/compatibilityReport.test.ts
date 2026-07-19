@@ -45,6 +45,38 @@ describe("compatibility report", () => {
     });
   });
 
+  it("fails when a provider format changes despite healthy rows", () => {
+    const value = snapshot();
+    value.collectors[0] = {
+      ...value.collectors[0],
+      formatChanged: true,
+    };
+
+    const report = buildCompatibilityReport(value, ["claude"]);
+
+    expect(report.passed).toBe(false);
+    expect(report.providers[0]).toMatchObject({
+      passed: false,
+      formatChanged: true,
+    });
+  });
+
+  it("fails when the provider row inventory changes", () => {
+    const value = snapshot();
+    value.collectors[0] = {
+      ...value.collectors[0],
+      rowInventoryChanged: true,
+    };
+
+    const report = buildCompatibilityReport(value, ["claude"]);
+
+    expect(report.passed).toBe(false);
+    expect(report.providers[0]).toMatchObject({
+      passed: false,
+      rowInventoryChanged: true,
+    });
+  });
+
   it("fails when an enabled provider has duplicate collector entries", () => {
     const value = snapshot();
     value.collectors.push({ ...value.collectors[0] });

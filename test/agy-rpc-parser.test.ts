@@ -219,6 +219,9 @@ describe("Agy local quota RPC parser", () => {
     expect(() =>
       parseAgyRpcQuota(singleBucket({ usedFraction: 0.5 }), meta)
     ).toThrow(ParserDriftError);
+    expect(() =>
+      parseAgyRpcQuota(singleBucket({ undocumentedFlag: false }), meta)
+    ).toThrow(ParserDriftError);
   });
 
   it("skips disabled buckets but validates disabled's type", () => {

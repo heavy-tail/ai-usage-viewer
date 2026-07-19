@@ -14,6 +14,7 @@ export type ProviderCompatibility = {
   adapterVersion?: string;
   formatFingerprint?: string;
   formatChanged?: boolean;
+  rowInventoryChanged?: boolean;
   error?: string;
 };
 
@@ -38,7 +39,12 @@ export function buildCompatibilityReport(
       ).length;
       return {
         provider: health.provider,
-        passed: health.ok && health.state === "ok" && rowCount > 0,
+        passed:
+          health.ok &&
+          health.state === "ok" &&
+          rowCount > 0 &&
+          health.formatChanged !== true &&
+          health.rowInventoryChanged !== true,
         state: health.state,
         attemptState:
           health.attemptState ??
@@ -48,6 +54,7 @@ export function buildCompatibilityReport(
         adapterVersion: health.adapterVersion,
         formatFingerprint: health.formatFingerprint,
         formatChanged: health.formatChanged,
+        rowInventoryChanged: health.rowInventoryChanged,
         error: health.error,
       };
     });

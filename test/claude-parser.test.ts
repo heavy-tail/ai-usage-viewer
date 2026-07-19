@@ -59,6 +59,28 @@ describe("Claude usage compatibility", () => {
     });
   });
 
+  it("accepts the current session row when Claude omits its reset", () => {
+    const text = usageText([]).replace(
+      "Resets 3:10am (Asia/Seoul)\n",
+      ""
+    );
+    const limits = parseClaudeUsage(text, meta);
+
+    expect(pick(limits, "claude:session")).toMatchObject({
+      usedPercent: 3,
+      resetLabel: undefined,
+    });
+  });
+
+  it("still rejects an all-model weekly row without its reset", () => {
+    const text = usageText([]).replace(
+      "Resets Jul 20, 4pm (Asia/Seoul)",
+      ""
+    );
+
+    expect(() => parseClaudeUsage(text, meta)).toThrow(ParserDriftError);
+  });
+
   it("keeps the newest complete value when the terminal redraws", () => {
     const first = usageText([]).replace("3% used", "2% used");
     const second = usageText([]).replace("3% used", "7% used");
@@ -110,6 +132,17 @@ describe("Claude usage compatibility", () => {
 
   it("reports drift when a recognized section has no value", () => {
     const text = usageText(["Current week (Fable)", "Loading usage data..."]);
+
+    expect(() => parseClaudeUsage(text, meta)).toThrow(ParserDriftError);
+  });
+
+  it("reports drift when distinct model labels collapse to the same id", () => {
+    const text = usageText([
+      "Current week (A+B)",
+      "10% used",
+      "Current week (A B)",
+      "20% used",
+    ]);
 
     expect(() => parseClaudeUsage(text, meta)).toThrow(ParserDriftError);
   });
