@@ -65,6 +65,10 @@ describe("privileged compatibility workflows", () => {
     expect(ci).toContain("BUILD-PROVENANCE.json");
     expect(ci).toContain("sourceCommit = $env:GITHUB_SHA.ToLowerInvariant()");
     expect(ci).toContain("packageVersion = $packageVersion");
+    expect(ci).toContain("$expectedPackageVersion =");
+    expect(ci).toContain(
+      "bundleProvenance.packageVersion -ne $expectedPackageVersion"
+    );
     expect(release).toContain("zipfile.ZipFile");
     expect(release).toContain('"sourceCommit": tested_sha');
     expect(release).toContain("Unexpected CI artifact inventory");
