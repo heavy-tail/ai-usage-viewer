@@ -3,6 +3,24 @@ param()
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+function Get-Sha256Hex {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string] $LiteralPath
+  )
+
+  $Stream = [IO.File]::OpenRead($LiteralPath)
+  $Hasher = [Security.Cryptography.SHA256]::Create()
+  try {
+    return ([BitConverter]::ToString(
+      $Hasher.ComputeHash($Stream)
+    )).Replace("-", "").ToLowerInvariant()
+  } finally {
+    $Hasher.Dispose()
+    $Stream.Dispose()
+  }
+}
+
 $SourcePath = Join-Path $PSScriptRoot "AgyJobHost.cs"
 $RuntimeDirectory = [IO.Path]::GetFullPath(
   (Join-Path $PSScriptRoot "..\.runtime")
@@ -34,12 +52,8 @@ if (-not $FrameworkRoot) {
 $CompilerPath = Join-Path $FrameworkRoot "csc.exe"
 $SystemAssembly = Join-Path $FrameworkRoot "System.dll"
 
-$SourceFileHash = (
-  Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256
-).Hash.ToLowerInvariant()
-$BuildScriptHash = (
-  Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256
-).Hash.ToLowerInvariant()
+$SourceFileHash = Get-Sha256Hex -LiteralPath $SourcePath
+$BuildScriptHash = Get-Sha256Hex -LiteralPath $PSCommandPath
 $HashBytes = [Text.Encoding]::UTF8.GetBytes(
   "$SourceFileHash`n$BuildScriptHash`nframework64-csc-v1`n"
 )
