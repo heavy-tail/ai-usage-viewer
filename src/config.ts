@@ -45,9 +45,9 @@ export async function loadConfig(rootDir: string): Promise<AppConfig> {
   // A present-but-malformed config must NOT silently fall back to defaults:
   // DEFAULT_CONFIG enables every provider, so a typo could re-enable collectors
   // the user meant to disable. Surface a clear error instead.
-  let parsed: Partial<AppConfig>;
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(text) as Partial<AppConfig>;
+    parsed = JSON.parse(text) as unknown;
   } catch (error) {
     throw new Error(
       `config.json is not valid JSON: ${
@@ -56,16 +56,25 @@ export async function loadConfig(rootDir: string): Promise<AppConfig> {
     );
   }
 
-  return mergeConfig(parsed);
+  return mergeConfig(validateConfig(parsed));
 }
 
-function mergeConfig(parsed: Partial<AppConfig>): AppConfig {
+type ConfigInput = {
+  enabledProviders?: UsageProvider[];
+  codex?: Partial<AppConfig["codex"]>;
+  agy?: Partial<AppConfig["agy"]>;
+  timezone?: string;
+  grokCommand?: string;
+  wsl?: Partial<AppConfig["wsl"]>;
+  planLabelFallback?: AppConfig["planLabelFallback"];
+};
+
+function mergeConfig(parsed: ConfigInput): AppConfig {
   const config = {
     ...DEFAULT_CONFIG,
     ...parsed,
-    enabledProviders: normalizeProviders(
-      parsed.enabledProviders ?? DEFAULT_CONFIG.enabledProviders
-    ),
+    enabledProviders:
+      parsed.enabledProviders ?? DEFAULT_CONFIG.enabledProviders,
     codex: {
       ...DEFAULT_CONFIG.codex,
       ...parsed.codex,
@@ -91,9 +100,142 @@ function mergeConfig(parsed: Partial<AppConfig>): AppConfig {
   return config;
 }
 
-function normalizeProviders(values: UsageProvider[]): UsageProvider[] {
-  const allowed: UsageProvider[] = ["claude", "codex", "agy", "grok"];
-  return values.filter((value): value is UsageProvider => allowed.includes(value));
+function validateConfig(value: unknown): ConfigInput {
+  const input = record(value, "must be a JSON object");
+  assertKnownKeys(input, [
+    "enabledProviders",
+    "codex",
+    "agy",
+    "timezone",
+    "grokCommand",
+    "wsl",
+    "planLabelFallback",
+  ]);
+  const result: ConfigInput = {};
+
+  if ("enabledProviders" in input) {
+    if (!Array.isArray(input.enabledProviders)) {
+      invalid("enabledProviders must be an array of provider names");
+    }
+    const allowed: UsageProvider[] = ["claude", "codex", "agy", "grok"];
+    const providers = input.enabledProviders.map((provider, index) => {
+      if (typeof provider !== "string" || !allowed.includes(provider as UsageProvider)) {
+        invalid(`enabledProviders[${index}] must be one of ${allowed.join(", ")}`);
+      }
+      return provider as UsageProvider;
+    });
+    if (new Set(providers).size !== providers.length) {
+      invalid("enabledProviders must not contain duplicate providers");
+    }
+    result.enabledProviders = providers;
+  }
+
+  if ("codex" in input) {
+    const codex = record(input.codex, "codex must be an object");
+    assertKnownKeys(codex, ["collectDefault", "additionalModelsForContext"], "codex");
+    const validated: Partial<AppConfig["codex"]> = {};
+    if ("collectDefault" in codex) {
+      if (typeof codex.collectDefault !== "boolean") {
+        invalid("codex.collectDefault must be a boolean");
+      }
+      validated.collectDefault = codex.collectDefault;
+    }
+    if ("additionalModelsForContext" in codex) {
+      validated.additionalModelsForContext = stringArray(
+        codex.additionalModelsForContext,
+        "codex.additionalModelsForContext"
+      );
+    }
+    result.codex = validated;
+  }
+
+  if ("agy" in input) {
+    const agy = record(input.agy, "agy must be an object");
+    assertKnownKeys(agy, ["pinnedGroups"], "agy");
+    const validated: Partial<AppConfig["agy"]> = {};
+    if ("pinnedGroups" in agy) {
+      validated.pinnedGroups = stringArray(agy.pinnedGroups, "agy.pinnedGroups");
+    }
+    result.agy = validated;
+  }
+
+  if ("timezone" in input) {
+    assertNonEmptyString(input.timezone, "timezone");
+    result.timezone = input.timezone;
+  }
+  if ("grokCommand" in input) {
+    assertNonEmptyString(input.grokCommand, "grokCommand");
+    result.grokCommand = input.grokCommand;
+  }
+
+  if ("wsl" in input) {
+    const wsl = record(input.wsl, "wsl must be an object");
+    assertKnownKeys(wsl, ["distro", "cwd", "grokCommand"], "wsl");
+    const validated: Partial<AppConfig["wsl"]> = {};
+    for (const key of ["distro", "cwd", "grokCommand"] as const) {
+      if (key in wsl) {
+        assertNonEmptyString(wsl[key], `wsl.${key}`);
+        validated[key] = wsl[key];
+      }
+    }
+    result.wsl = validated;
+  }
+
+  if ("planLabelFallback" in input) {
+    const labels = record(
+      input.planLabelFallback,
+      "planLabelFallback must be an object"
+    );
+    const providers: UsageProvider[] = ["claude", "codex", "agy", "grok"];
+    assertKnownKeys(labels, providers, "planLabelFallback");
+    const validated: AppConfig["planLabelFallback"] = {};
+    for (const provider of providers) {
+      if (provider in labels) {
+        assertNonEmptyString(labels[provider], `planLabelFallback.${provider}`);
+        validated[provider] = labels[provider];
+      }
+    }
+    result.planLabelFallback = validated;
+  }
+
+  return result;
+}
+
+function record(value: unknown, message: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    invalid(message);
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertKnownKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  path = ""
+): void {
+  const unknown = Object.keys(value).find((key) => !allowed.includes(key));
+  if (unknown) invalid(`${path ? `${path}.` : ""}${unknown} is not a recognized setting`);
+}
+
+function stringArray(value: unknown, path: string): string[] {
+  if (!Array.isArray(value)) invalid(`${path} must be an array of strings`);
+  return value.map((item, index) => {
+    assertNonEmptyString(item, `${path}[${index}]`);
+    return item;
+  });
+}
+
+function assertNonEmptyString(
+  value: unknown,
+  path: string
+): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) {
+    invalid(`${path} must be a non-empty string`);
+  }
+}
+
+function invalid(message: string): never {
+  throw new Error(`config.json ${message}.`);
 }
 
 function isMissingFileError(error: unknown): boolean {

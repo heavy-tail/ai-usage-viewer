@@ -20,23 +20,23 @@ describe("Collectors with mocked provider output", () => {
     expect(ptyRunner).not.toHaveBeenCalled();
   });
 
-  it("maps PTY timeout to collector error", async () => {
-    const ptyRunner = vi.fn(async () => {
-      throw new PtyTimeoutError("timed out", "raw timeout", "clean timeout");
-    }) as unknown as PtyRunner;
+  it("fails closed without a terminal when Codex structured quota is unavailable", async () => {
+    const ptyRunner = vi.fn() as unknown as PtyRunner;
 
     const result = await collectCodex(context({ ptyRunner }), {
       appServerReader: async () => {
-        throw new CodexAppServerError("app-server unavailable in TUI fallback test");
+        throw new CodexAppServerError("app-server unavailable", "safe diagnostic");
       },
     });
 
-    expect(result.state).toBe("error");
-    expect(result.error).toBe("timed out");
-    expect(result.cleanedText).toBe("clean timeout");
+    expect(result.state).toBe("unavailable");
+    expect(result.error).toContain("structured quota source is unavailable");
+    expect(result.cleanedText).toBe("safe diagnostic");
+    expect(result.limits).toEqual([]);
+    expect(ptyRunner).not.toHaveBeenCalled();
   });
 
-  it("keeps Codex footer quota when status enrichment times out", async () => {
+  it("does not promote a captured Codex footer after structured failure", async () => {
     const footer =
       "gpt-5.5 xhigh fast · Context 100% left · 5h 97% left · weekly 76% left";
     const ptyRunner = vi.fn(async () => {
@@ -53,16 +53,9 @@ describe("Collectors with mocked provider output", () => {
       },
     });
 
-    expect(result.state).toBe("ok");
-    expect(result.error).toBeUndefined();
-    expect(result.limits.find((limit) => limit.id === "codex:5h")).toMatchObject({
-      remainingPercent: 97,
-      resetLabel: undefined,
-    });
-    expect(result.limits.find((limit) => limit.id === "codex:weekly")).toMatchObject({
-      remainingPercent: 76,
-      resetLabel: undefined,
-    });
+    expect(result.state).toBe("unavailable");
+    expect(result.limits).toEqual([]);
+    expect(ptyRunner).not.toHaveBeenCalled();
   });
 
   it("maps AGY local service failure to collector error", async () => {
@@ -94,8 +87,7 @@ describe("Collectors with mocked provider output", () => {
 
   it("collects AGY's structured quota without starting a PTY", async () => {
     const ptyRunner = vi.fn() as unknown as PtyRunner;
-    const result = await collectAgy(context({ ptyRunner }), {
-      rpcReader: async () => ({
+    const rpcReader = vi.fn(async () => ({
         payload: {
           response: {
             groups: [
@@ -109,23 +101,61 @@ describe("Collectors with mocked provider output", () => {
             ],
           },
         },
-      }),
+      }));
+    const result = await collectAgy(context({ ptyRunner }), {
+      rpcReader,
     });
 
     expect(result.state).toBe("ok");
     expect(result.limits).toHaveLength(2);
     expect(result.cleanedText).toContain("agy local quota API");
+    expect(rpcReader).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: 15_000 })
+    );
+    expect(rpcReader).toHaveBeenCalledTimes(1);
     expect(ptyRunner).not.toHaveBeenCalled();
   });
 
-  it("recognizes Grok's current ready footer and collects both quota rows", async () => {
+  it("retries one timed-out AGY startup within the collector deadline", async () => {
+    const ptyRunner = vi.fn() as unknown as PtyRunner;
+    const rpcReader = vi
+      .fn()
+      .mockRejectedValueOnce(new AgyRpcError("cold start timed out", "timeout"))
+      .mockResolvedValueOnce({
+        payload: {
+          response: {
+            groups: [
+              {
+                displayName: "Gemini Models",
+                buckets: [{ window: "weekly", remainingFraction: 1 }],
+              },
+            ],
+          },
+        },
+      });
+
+    const result = await collectAgy(context({ ptyRunner }), { rpcReader });
+
+    expect(result.state).toBe("ok");
+    expect(rpcReader).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ timeoutMs: 15_000 })
+    );
+    expect(rpcReader).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ timeoutMs: 30_000 })
+    );
+  });
+
+  it("uses Grok's input prompt and collects complete /usage rows", async () => {
     const ptyRunner = vi.fn(async (options) => {
       expect(options.steps[0]?.waitFor).toBeInstanceOf(RegExp);
-      expect((options.steps[0]?.waitFor as RegExp).test("Weekly limit left: 17%"))
+      expect(options.steps[2]?.send).toBe("/usage show\r");
+      expect((options.steps[0]?.waitFor as RegExp).test("│ > "))
         .toBe(true);
       return {
-        rawOutput: "Weekly limit left: 17%\nMonthly limit: 30%",
-        cleanedOutput: "Weekly limit left: 17%\nMonthly limit: 30%",
+        rawOutput: "Weekly limit: 83%\nMonthly limit: 30%",
+        cleanedOutput: "Weekly limit: 83%\nMonthly limit: 30%",
       };
     }) as unknown as PtyRunner;
 
@@ -138,7 +168,7 @@ describe("Collectors with mocked provider output", () => {
     ]);
   });
 
-  it("keeps Grok's fresh weekly footer when the detail command changes", async () => {
+  it("does not publish a partial Grok warning footer when /usage fails", async () => {
     const footer = "Grok 4.5 (high)\n>\n[stable] Weekly limit left: 0%";
     const ptyRunner = vi.fn(async () => {
       throw new PtyTimeoutError("detail timed out", footer, footer);
@@ -146,13 +176,9 @@ describe("Collectors with mocked provider output", () => {
 
     const result = await collectGrok(context({ ptyRunner }));
 
-    expect(result.state).toBe("ok");
-    expect(result.limits).toHaveLength(1);
-    expect(result.limits[0]).toMatchObject({
-      id: "grok:weekly",
-      remainingPercent: 0,
-      usedPercent: 100,
-    });
+    expect(result.state).toBe("error");
+    expect(result.limits).toEqual([]);
+    expect(result.error).toBe("detail timed out");
   });
 });
 
@@ -170,17 +196,17 @@ function context(input: {
 
 function commandRunner(available: boolean): CommandRunner {
   return async (command, args) => {
-    if (command === "where.exe") {
+    if (command.toLowerCase().endsWith("\\where.exe")) {
       return {
         stdout: available ? `C:\\Tools\\${args[0]}.exe\n` : "",
         stderr: "",
         exitCode: available ? 0 : 1,
       };
     }
-    if (command === "codex") {
+    if (/codex(?:\.exe|\.cmd)?$/i.test(command)) {
       return { stdout: "Logged in using ChatGPT\n", stderr: "", exitCode: 0 };
     }
-    if (command === "claude") {
+    if (/claude(?:\.exe|\.cmd)?$/i.test(command)) {
       return {
         stdout:
           "loggedIn: true\nsubscriptionType: max\nemail: test@example.com\n",

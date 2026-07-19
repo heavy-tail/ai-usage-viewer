@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
+  UsageRow,
   lastVerifiedLabel,
   toneForUsageRow,
 } from "../src/components/UsageRow";
@@ -52,5 +55,27 @@ describe("UsageRow", () => {
         "Asia/Seoul"
       )
     ).toBe("Last verified Jul 18, 9:00 PM");
+  });
+
+  it("renders safely when stored provider reset text is malformed", () => {
+    const limit = {
+      id: "claude:week",
+      provider: "claude",
+      providerLabel: "Claude Code",
+      scope: "Current week",
+      usedPercent: 10,
+      remainingPercent: 90,
+      resetLabel: "Resets in 104000000d",
+      status: "available",
+      sourceCommand: "fixture",
+      sourceText: "fixture",
+      checkedAt: "2026-07-18T12:00:00.000Z",
+    } satisfies UsageLimit;
+
+    expect(() =>
+      renderToStaticMarkup(
+        createElement(UsageRow, { limit, timeZone: "Asia/Seoul" })
+      )
+    ).not.toThrow();
   });
 });

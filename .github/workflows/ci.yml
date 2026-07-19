@@ -63,6 +63,22 @@ jobs:
           Copy-Item -Recurse "src" $bundleDir
           Copy-Item "config.example.json", "index.html", "LICENSE", "package.json", "package-lock.json", "README.md", "tsconfig.json", "vite.config.ts" $bundleDir
 
+          if ($env:GITHUB_SHA -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "GITHUB_SHA is not a full Git commit id."
+          }
+          $provenance = [ordered]@{
+            schemaVersion = 1
+            sourceRepository = $env:GITHUB_REPOSITORY
+            sourceCommit = $env:GITHUB_SHA.ToLowerInvariant()
+            packageVersion = $packageVersion
+          } | ConvertTo-Json
+          $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText(
+            (Join-Path $bundleDir "BUILD-PROVENANCE.json"),
+            "$provenance`n",
+            $utf8WithoutBom
+          )
+
           @"
           AI Usage Viewer Windows/Node deployment bundle
 
@@ -149,6 +165,16 @@ jobs:
             New-Item -ItemType Directory -Path $smokeRoot | Out-Null
             Expand-Archive -LiteralPath $archive[0].FullName -DestinationPath $smokeRoot
             $bundleRoot = Join-Path $smokeRoot "usage-viewer"
+            $bundlePackage = Get-Content -Raw (Join-Path $bundleRoot "package.json") |
+              ConvertFrom-Json
+            $bundleProvenance = Get-Content -Raw (Join-Path $bundleRoot "BUILD-PROVENANCE.json") |
+              ConvertFrom-Json
+            if ([string]$bundlePackage.version -ne [string]$bundleProvenance.packageVersion -or
+                [string]$bundleProvenance.packageVersion -ne $packageVersion -or
+                [string]$bundleProvenance.sourceRepository -ne $env:GITHUB_REPOSITORY -or
+                [string]$bundleProvenance.sourceCommit -ne $env:GITHUB_SHA.ToLowerInvariant()) {
+              throw "The extracted bundle provenance does not match this CI run."
+            }
 
             # This is deliberately a clean install from the files actually in the ZIP.
             Push-Location $bundleRoot

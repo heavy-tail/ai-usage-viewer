@@ -5,6 +5,43 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$System32Dir = [IO.Path]::GetFullPath(
+  (Join-Path $env:SystemRoot "System32")
+)
+$PowerShellPath = Join-Path $System32Dir "WindowsPowerShell\v1.0\powershell.exe"
+$ComSpecPath = Join-Path $System32Dir "cmd.exe"
+$NodePath = [IO.Path]::GetFullPath(
+  (Join-Path $env:ProgramFiles "nodejs\node.exe")
+)
+if (-not (Test-Path -LiteralPath $PowerShellPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $ComSpecPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $NodePath -PathType Leaf)) {
+  throw "AI Usage Viewer requires the trusted Windows PowerShell, cmd.exe, and Program Files Node.js installation."
+}
+
+# Block inherited variables that can inject JavaScript or replace the command
+# shell in otherwise absolute child launches. Provider credentials, proxy
+# settings, profiles, and PATH remain available to the collectors.
+foreach ($UnsafeEnvironmentName in @(
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+  "NPM_CONFIG_NODE_OPTIONS",
+  "NPM_CONFIG_SCRIPT_SHELL"
+)) {
+  [Environment]::SetEnvironmentVariable(
+    $UnsafeEnvironmentName,
+    $null,
+    "Process"
+  )
+}
+[Environment]::SetEnvironmentVariable("ComSpec", $ComSpecPath, "Process")
+[Environment]::SetEnvironmentVariable(
+  "PATHEXT",
+  ".COM;.EXE;.BAT;.CMD",
+  "Process"
+)
+
 # Some desktop hosts pass both `Path` and `PATH` in the process environment.
 # Windows treats those names as equivalent, but Windows PowerShell's
 # Start-Process rejects the duplicate environment block. Preserve the effective
@@ -69,20 +106,39 @@ function Wait-HttpOk {
   return $false
 }
 
-function Start-HiddenNpm {
+function Start-HiddenProcess {
   param(
+    [string] $FilePath,
     [string[]] $Arguments,
-    [string] $LogName
+    [string] $LogName,
+    [switch] $Wait
   )
 
-  return Start-Process `
-    -FilePath "npm.cmd" `
-    -ArgumentList $Arguments `
-    -WorkingDirectory $RootDir `
-    -WindowStyle Hidden `
-    -PassThru `
-    -RedirectStandardOutput (Join-Path $LogDir "$LogName.log") `
-    -RedirectStandardError (Join-Path $LogDir "$LogName.err")
+  $StartParameters = @{
+    FilePath = $FilePath
+    ArgumentList = $Arguments
+    WorkingDirectory = $RootDir
+    WindowStyle = "Hidden"
+    PassThru = $true
+    RedirectStandardOutput = (Join-Path $LogDir "$LogName.log")
+    RedirectStandardError = (Join-Path $LogDir "$LogName.err")
+  }
+  if ($Wait) {
+    $StartParameters.Wait = $true
+  }
+  return Start-Process @StartParameters
+}
+
+function ConvertTo-WindowsProcessArgument {
+  param([string] $Value)
+
+  if ($Value.Contains('"') -or $Value.Contains("`0")) {
+    throw "A child-process argument contains an unsupported character."
+  }
+  if ($Value -match '\s') {
+    return "`"$Value`""
+  }
+  return $Value
 }
 
 function Get-BackendFingerprint {
@@ -395,8 +451,16 @@ function Get-VerifiedViewerListenerProcess {
       Win32_Process `
       -Filter "ProcessId = $ownerPid" `
       -ErrorAction Stop
-    if (-not $record -or
-        [System.IO.Path]::GetFileName([string]$record.ExecutablePath) -ine "node.exe") {
+    if (-not $record) {
+      return $null
+    }
+    $listenerExecutable = [System.IO.Path]::GetFullPath(
+      [string]$record.ExecutablePath
+    ).TrimEnd("\")
+    if (-not $listenerExecutable.Equals(
+          $NodePath.TrimEnd("\"),
+          [System.StringComparison]::OrdinalIgnoreCase
+        )) {
       return $null
     }
 
@@ -490,6 +554,7 @@ function Save-ManagedServerState {
     pid = [int]$Identity.pid
     processStartedAtUtc = [string]$Identity.processStartedAtUtc
     backendFingerprint = $BackendFingerprint
+    nodeExecutable = $NodePath
   }
   $json = $state | ConvertTo-Json -Compress
   $tempPath = "$ServerStatePath.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
@@ -514,11 +579,37 @@ function Save-ManagedServerState {
 function Start-ManagedServer {
   param([string] $BackendFingerprint)
 
+  $preflightPath = [IO.Path]::GetFullPath(
+    (Join-Path $RootDir "node_modules\tsx\dist\preflight.cjs")
+  )
+  $loaderPath = [IO.Path]::GetFullPath(
+    (Join-Path $RootDir "node_modules\tsx\dist\loader.mjs")
+  )
+  $serverPath = [IO.Path]::GetFullPath(
+    (Join-Path $RootDir "src\server.ts")
+  )
+  foreach ($requiredPath in @($preflightPath, $loaderPath, $serverPath)) {
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+      throw "AI Usage Viewer runtime files are missing. Run npm ci and try again."
+    }
+  }
+  $loaderUri = [Uri]::new($loaderPath).AbsoluteUri
+  $nodeArguments = @(
+    "--require"
+    "`"$preflightPath`""
+    "--import"
+    $loaderUri
+    "`"$serverPath`""
+  )
+
   $hadFingerprint = Test-Path Env:\USAGE_VIEWER_SOURCE_FINGERPRINT
   $previousFingerprint = $env:USAGE_VIEWER_SOURCE_FINGERPRINT
   try {
     $env:USAGE_VIEWER_SOURCE_FINGERPRINT = $BackendFingerprint
-    return Start-HiddenNpm -Arguments @("start") -LogName "desktop-server"
+    return Start-HiddenProcess `
+      -FilePath $NodePath `
+      -Arguments $nodeArguments `
+      -LogName "desktop-server"
   } finally {
     if ($hadFingerprint) {
       $env:USAGE_VIEWER_SOURCE_FINGERPRINT = $previousFingerprint
@@ -655,21 +746,61 @@ function Ensure-ProductionBuild {
     return
   }
 
-  $process = Start-Process `
-    -FilePath "npm.cmd" `
-    -ArgumentList @("run", "build") `
-    -WorkingDirectory $RootDir `
-    -WindowStyle Hidden `
-    -Wait `
-    -PassThru `
-    -RedirectStandardOutput (Join-Path $LogDir "desktop-build.log") `
-    -RedirectStandardError (Join-Path $LogDir "desktop-build.err")
+  $buildScript = [IO.Path]::GetFullPath(
+    (Join-Path $RootDir "scripts\build-agy-job-host.ps1")
+  )
+  $tscScript = [IO.Path]::GetFullPath(
+    (Join-Path $RootDir "node_modules\typescript\bin\tsc")
+  )
+  $viteScript = [IO.Path]::GetFullPath(
+    (Join-Path $RootDir "node_modules\vite\bin\vite.js")
+  )
+  foreach ($requiredPath in @($buildScript, $tscScript, $viteScript)) {
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+      throw "AI Usage Viewer build dependencies are missing. Run npm ci and try again."
+    }
+  }
 
-  if ($process.ExitCode -ne 0 -or
+  $buildSteps = @(
+    @{
+      FilePath = $PowerShellPath
+      Arguments = @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "`"$buildScript`""
+      )
+      LogName = "desktop-build-job-host"
+    },
+    @{
+      FilePath = $NodePath
+      Arguments = @("`"$tscScript`"", "-b")
+      LogName = "desktop-build-typescript"
+    },
+    @{
+      FilePath = $NodePath
+      Arguments = @("`"$viteScript`"", "build")
+      LogName = "desktop-build-vite"
+    }
+  )
+  foreach ($step in $buildSteps) {
+    $process = Start-HiddenProcess `
+      -FilePath $step.FilePath `
+      -Arguments $step.Arguments `
+      -LogName $step.LogName `
+      -Wait
+    if ($process.ExitCode -ne 0) {
+      throw "Could not build AI Usage Viewer. See data/logs/$($step.LogName).err."
+    }
+  }
+
+  if (
       -not (Test-Path $indexPath) -or
       -not (Test-Path $jobHostPath) -or
       -not (Test-Path $jobHostStampPath)) {
-    throw "Could not build the dashboard. See data/logs/desktop-build.err."
+    throw "AI Usage Viewer build completed without all required outputs."
   }
 }
 
@@ -687,7 +818,10 @@ $successLog = [string]$payload.successLog
 $errorLog = [string]$payload.errorLog
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 try {
-  Invoke-RestMethod -Uri ([Uri]$refreshUrl) -Method Post | Out-Null
+  Invoke-RestMethod `
+    -Uri ([Uri]$refreshUrl) `
+    -Method Post `
+    -TimeoutSec 60 | Out-Null
   [System.IO.File]::WriteAllText(
     $successLog,
     "Refresh completed at $((Get-Date).ToString("s"))",
@@ -710,11 +844,28 @@ try {
     [System.Text.Encoding]::UTF8.GetBytes($payloadJson)
   )
   $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-  $startInfo.FileName = Join-Path `
-    $env:SystemRoot `
-    "System32\WindowsPowerShell\v1.0\powershell.exe"
-  $startInfo.Arguments =
-    "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedScript"
+  $jobHostPath = [IO.Path]::GetFullPath(
+    (Join-Path $RootDir ".runtime\agy-job-host.exe")
+  )
+  if (-not $ServerProcess -or
+      [int]$ServerProcess.Id -le 0 -or
+      -not (Test-Path -LiteralPath $jobHostPath -PathType Leaf)) {
+    throw "Could not establish the background refresh lifetime boundary."
+  }
+  $startInfo.FileName = $jobHostPath
+  $refreshArguments = @(
+    "--pipe",
+    [string]$ServerProcess.Id,
+    $PowerShellPath,
+    $RootDir,
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand",
+    $encodedScript
+  ) | ForEach-Object { ConvertTo-WindowsProcessArgument $_ }
+  $startInfo.Arguments = $refreshArguments -join " "
   $startInfo.WorkingDirectory = $RootDir
   $startInfo.UseShellExecute = $false
   $startInfo.CreateNoWindow = $true

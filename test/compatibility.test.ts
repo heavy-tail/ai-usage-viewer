@@ -14,7 +14,7 @@ describe("provider adapter contract", () => {
     expect(result).toMatchObject({
       ok: true,
       state: "ok",
-      adapterVersion: "2.2.0",
+      adapterVersion: "2.6.0",
     });
     expect(result.formatFingerprint).toMatch(/^[a-f0-9]{16}$/);
   });
@@ -58,6 +58,39 @@ describe("provider adapter contract", () => {
 
     expect(first).toBe(second);
     expect(first).not.toContain("person");
+  });
+
+  it("ignores unrelated TUI chrome after a successfully parsed quota row", () => {
+    const first = verifyCollectorResult({
+      ...success([limit()]),
+      cleanedText: "Current session 10% used\nfirst rotating suggestion",
+    });
+    const second = verifyCollectorResult({
+      ...success([limit()]),
+      cleanedText: "Current session 10% used\ncompletely different prompt chrome",
+    });
+
+    expect(first.formatFingerprint).toBe(second.formatFingerprint);
+  });
+
+  it("does not treat Claude's conditional model row as a layout contract", () => {
+    const core = limit();
+    const withModelRow = verifyCollectorResult(
+      success([
+        core,
+        {
+          ...core,
+          id: "claude:week-fable",
+          scope: "Current week (Fable)",
+          window: "weekly",
+        },
+      ])
+    );
+    const withoutModelRow = verifyCollectorResult(success([core]));
+
+    expect(withModelRow.formatFingerprint).toBe(
+      withoutModelRow.formatFingerprint
+    );
   });
 
   it("ignores changing opaque reset-credit identifiers", () => {

@@ -4,8 +4,9 @@ import {
   parseClaudeAuthStatus,
   parseClaudeUsage,
 } from "../parsers/claude";
+import { localSourceTimeZone } from "../parsers/common";
 import { CollectorUnavailableError } from "./errors";
-import { isCommandAvailable } from "./command";
+import { resolveCommandPath } from "./command";
 import { failedResult, okResult } from "./helpers";
 import type { CollectorContext, ProviderCollectorResult } from "./types";
 
@@ -21,13 +22,16 @@ export async function collectClaude(
   const rawFileName = "claude.txt";
 
   try {
-    if (
-      !(await isCommandAvailable("claude", context.rootDir, context.commandRunner))
-    ) {
+    const command = await resolveCommandPath(
+      "claude",
+      context.rootDir,
+      context.commandRunner
+    );
+    if (!command) {
       throw new CollectorUnavailableError("Claude CLI is not installed.");
     }
 
-    const authText = await readClaudeAuthStatus(context);
+    const authText = await readClaudeAuthStatus(context, command);
     const auth = parseClaudeAuthStatus(authText);
     if (authText && !auth.loggedIn) {
       throw new CollectorUnavailableError(
@@ -37,9 +41,9 @@ export async function collectClaude(
       );
     }
 
-    const claudeArgs = await supportedClaudeArgs(context);
+    const claudeArgs = await supportedClaudeArgs(context, command);
     const pty = await context.ptyRunner({
-      command: "claude",
+      command,
       args: claudeArgs,
       cwd: context.rootDir,
       // Covers the worst-case sum of the startup, core-usage, and optional
@@ -67,6 +71,17 @@ export async function collectClaude(
           waitFor: /^[\t ]*Usage credits[\t ]*$/im,
           timeoutMs: 5_000,
           optional: true,
+          // Credits can paint before the asynchronous model-specific scan has
+          // committed its final row. The contribution heading below is the
+          // semantic completion signal for that scan.
+          delayMs: 250,
+        },
+        {
+          waitFor: /What's contributing to your limits usage\?/i,
+          timeoutMs: 6_000,
+          optional: true,
+          // Older builds/plans omit the contribution panel. In that case the
+          // optional wait itself provides a bounded settle period.
           delayMs: 250,
         },
         { send: "\x1b", delayMs: 100 },
@@ -89,6 +104,7 @@ export async function collectClaude(
     const meta = {
       checkedAt,
       sourceCommand: "claude -> /usage",
+      sourceTimeZone: localSourceTimeZone(),
       planLabel: claudePlanLabel(
         auth,
         context.config.planLabelFallback.claude
@@ -112,17 +128,23 @@ export async function collectClaude(
   }
 }
 
-async function readClaudeAuthStatus(context: CollectorContext): Promise<string> {
-  const result = await context.commandRunner("claude", ["auth", "status"], {
+async function readClaudeAuthStatus(
+  context: CollectorContext,
+  command: string
+): Promise<string> {
+  const result = await context.commandRunner(command, ["auth", "status"], {
     cwd: context.rootDir,
     timeoutMs: 5_000,
   });
   return [result.stdout, result.stderr].filter(Boolean).join("\n");
 }
 
-async function supportedClaudeArgs(context: CollectorContext): Promise<string[]> {
+async function supportedClaudeArgs(
+  context: CollectorContext,
+  command: string
+): Promise<string[]> {
   try {
-    const result = await context.commandRunner("claude", ["--help"], {
+    const result = await context.commandRunner(command, ["--help"], {
       cwd: context.rootDir,
       timeoutMs: 5_000,
     });

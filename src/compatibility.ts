@@ -6,10 +6,10 @@ import type { ProviderCollectorResult } from "./collectors/types";
 // relevant value whenever a provider contract changes so snapshots and canary
 // reports identify exactly which compatibility code produced them.
 export const ADAPTER_VERSIONS: Record<UsageProvider, string> = {
-  claude: "2.2.0",
-  codex: "2.2.0",
-  agy: "2.1.0",
-  grok: "2.1.0",
+  claude: "2.6.0",
+  codex: "2.3.0",
+  agy: "2.3.0",
+  grok: "2.3.0",
 };
 
 /**
@@ -24,7 +24,7 @@ export function verifyCollectorResult(
   const enriched: ProviderCollectorResult = {
     ...result,
     adapterVersion: ADAPTER_VERSIONS[result.provider],
-    formatFingerprint: fingerprintFormat(result.cleanedText),
+    formatFingerprint: fingerprintFormat(formatEvidence(result)),
   };
 
   if (!result.ok) return enriched;
@@ -42,6 +42,31 @@ export function verifyCollectorResult(
     limits: [],
     error: `Adapter contract rejected the refresh: ${issues.join("; ")}`,
   };
+}
+
+function formatEvidence(result: ProviderCollectorResult): string {
+  if (!result.ok || result.limits.length === 0) return result.cleanedText;
+
+  // Successful parsers already isolate the quota-bearing sections in each
+  // row's sourceText. Hash those sections instead of the entire TUI transcript,
+  // whose prompts, suggestions and redraw debris can change independently of
+  // the provider contract and create false drift alarms.
+  return [...result.limits]
+    // Claude's model-specific weekly row is derived from an asynchronous local
+    // session scan and is conditionally omitted by the provider. Its content is
+    // still validated when present, but it is not a stable layout contract.
+    .filter((limit) => !isConditionallyReportedLimit(limit))
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .map((limit) => `${limit.id}\n${limit.sourceText.trim()}`)
+    .join("\n\n");
+}
+
+export function isConditionallyReportedLimit(limit: UsageLimit): boolean {
+  return (
+    limit.provider === "claude" &&
+    limit.id.startsWith("claude:week-") &&
+    limit.id !== "claude:week-all"
+  );
 }
 
 export function validateLimits(

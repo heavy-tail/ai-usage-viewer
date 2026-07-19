@@ -5,7 +5,14 @@ import {
   type SpawnOptionsWithoutStdio,
 } from "node:child_process";
 import { promisify } from "node:util";
+import { isAbsolute } from "node:path";
 import packageMetadata from "../../package.json";
+import { commandLaunchSpec } from "./command";
+import { WINDOWS_JOB_HOST_PATH } from "./windowsJobHost";
+import {
+  trustedChildEnvironment,
+  windowsSystem32Executable,
+} from "./windowsSystem";
 
 const INITIALIZE_REQUEST_ID = 1;
 const RATE_LIMITS_REQUEST_ID = 2;
@@ -41,10 +48,11 @@ export type CodexAppServerSpawn = (
 
 export type CodexAppServerReader = (input: {
   cwd: string;
+  command?: string;
+  commandArgs?: string[];
   timeoutMs?: number;
   spawnProcess?: CodexAppServerSpawn;
   platform?: NodeJS.Platform;
-  windowsCommandShell?: string;
   maxOutputBytes?: number;
   terminationTimeoutMs?: number;
   terminateProcess?: CodexAppServerTerminate;
@@ -74,10 +82,11 @@ export class CodexAppServerError extends Error {
  */
 export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
   cwd,
+  command = "codex",
+  commandArgs = [],
   timeoutMs = DEFAULT_TIMEOUT_MS,
   spawnProcess = defaultSpawn,
   platform = process.platform,
-  windowsCommandShell = process.env.ComSpec ?? "cmd.exe",
   maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
   terminationTimeoutMs = DEFAULT_TERMINATION_TIMEOUT_MS,
   terminateProcess = terminateAppServerProcess,
@@ -94,11 +103,12 @@ export const readCodexAppServerRateLimits: CodexAppServerReader = async ({
   }
   let child: ChildProcessWithoutNullStreams;
   try {
-    const launch = appServerLaunch(platform, windowsCommandShell);
+    const launch = appServerLaunch(platform, command, commandArgs, cwd);
     child = spawnProcess(launch.command, launch.args, {
       cwd,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
+      env: trustedChildEnvironment({}, process.env, platform),
     });
   } catch (error) {
     throw new CodexAppServerError(
@@ -285,7 +295,7 @@ async function terminateAppServerProcess(
   if (platform === "win32" && Number.isInteger(child.pid) && child.pid! > 0) {
     try {
       await execFileAsync(
-        "taskkill.exe",
+        windowsSystem32Executable("taskkill.exe"),
         ["/pid", String(child.pid), "/T", "/F"],
         { windowsHide: true, timeout: timeoutMs }
       );
@@ -340,18 +350,31 @@ const defaultSpawn: CodexAppServerSpawn = (command, args, options) =>
 
 function appServerLaunch(
   platform: NodeJS.Platform,
-  windowsCommandShell: string
+  command: string,
+  commandArgs: string[],
+  cwd: string
 ): { command: string; args: string[] } {
-  if (platform === "win32") {
-    // npm-installed CLIs are commonly .cmd shims, which Node cannot execute
-    // directly on current Windows releases. The command text is fixed (no
-    // user-controlled interpolation), while cwd remains a structured option.
-    return {
-      command: windowsCommandShell,
-      args: ["/d", "/s", "/c", "codex app-server"],
-    };
+  const direct = commandLaunchSpec(
+    command,
+    [...commandArgs, "app-server"],
+    platform
+  );
+  if (platform !== "win32") return direct;
+  if (!isAbsolute(direct.command)) {
+    throw new CodexAppServerError(
+      "Codex app-server command must resolve to an absolute path on Windows."
+    );
   }
-  return { command: "codex", args: ["app-server"] };
+  return {
+    command: WINDOWS_JOB_HOST_PATH,
+    args: [
+      "--pipe",
+      String(process.pid),
+      direct.command,
+      cwd,
+      ...direct.args,
+    ],
+  };
 }
 
 function jsonRpcError(

@@ -14,6 +14,8 @@ type WallClock = {
   hour: number;
   minute: number;
 };
+const MAX_RESET_LABEL_LENGTH = 128;
+const MAX_RELATIVE_RESET_MS = 370 * 24 * 60 * 60_000;
 
 const MONTHS = new Map(
   [
@@ -50,55 +52,75 @@ export function displayResetLabel(
   const timeZone = validTimeZone(
     options.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone
   );
-  const instant = resetInstant(limit, timeZone);
+  // A display preference must never supply the missing source timezone.
+  // Collectors canonicalize offset-less provider labels at collection time;
+  // historical labels without source context remain verbatim.
+  const instant = resolveResetInstant(limit);
   if (!instant) return limit.resetLabel;
 
-  const formatter = new Intl.DateTimeFormat(options.locale ?? "en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-    ...(timeZone ? { timeZone } : {}),
-  });
-  return `Resets ${formatter.format(instant)}`;
+  try {
+    const formatter = new Intl.DateTimeFormat(options.locale ?? "en-US", {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+      ...(timeZone ? { timeZone } : {}),
+    });
+    return `Resets ${formatter.format(instant)}`;
+  } catch {
+    return limit.resetLabel;
+  }
 }
 
-function resetInstant(limit: ResetFields, displayTimeZone?: string): Date | undefined {
+export function resolveResetInstant(
+  limit: ResetFields,
+  sourceTimeZone?: string
+): Date | undefined {
   if (limit.resetAt) {
     const instant = new Date(limit.resetAt);
-    if (!Number.isNaN(instant.valueOf())) return instant;
+    if (Number.isFinite(instant.valueOf())) return instant;
   }
 
   if (!limit.resetLabel) return undefined;
+  if (limit.resetLabel.length > MAX_RESET_LABEL_LENGTH) return undefined;
   const checkedAt = new Date(limit.checkedAt);
-  if (Number.isNaN(checkedAt.valueOf())) return undefined;
+  if (!Number.isFinite(checkedAt.valueOf())) return undefined;
 
   const relative = parseRelativeReset(limit.resetLabel, checkedAt);
   if (relative) return relative;
 
-  return parseAbsoluteReset(limit.resetLabel, checkedAt, displayTimeZone);
+  return parseAbsoluteReset(limit.resetLabel, checkedAt, sourceTimeZone);
 }
 
 function parseRelativeReset(label: string, checkedAt: Date): Date | undefined {
   const match = label.match(
-    /^(?:Resets?|Refreshes?)\s+in\s+(?:(\d+)\s*d(?:ays?)?\s*)?(?:(\d+)\s*h(?:ours?)?\s*)?(?:(\d+)\s*m(?:in(?:utes?)?)?)?$/i
+    /^(?:Resets?|Refreshes?)\s+in\s+(?:(\d{1,4})\s*d(?:ays?)?\s*)?(?:(\d{1,4})\s*h(?:ours?)?\s*)?(?:(\d{1,3})\s*m(?:in(?:utes?)?)?)?$/i
   );
   if (!match || !match.slice(1).some((value) => value != null)) return undefined;
 
   const days = Number(match[1] ?? 0);
   const hours = Number(match[2] ?? 0);
   const minutes = Number(match[3] ?? 0);
+  if (days > 366 || hours > 8_784 || minutes > 59) return undefined;
   const durationMs = ((days * 24 + hours) * 60 + minutes) * 60_000;
-  if (!Number.isSafeInteger(durationMs) || durationMs < 0) return undefined;
-  return new Date(checkedAt.getTime() + durationMs);
+  if (
+    !Number.isSafeInteger(durationMs) ||
+    durationMs < 0 ||
+    durationMs > MAX_RELATIVE_RESET_MS
+  ) {
+    return undefined;
+  }
+  const result = new Date(checkedAt.getTime() + durationMs);
+  return Number.isFinite(result.valueOf()) ? result : undefined;
 }
 
 function parseAbsoluteReset(
   label: string,
   checkedAt: Date,
-  displayTimeZone?: string
+  fallbackSourceTimeZone?: string
 ): Date | undefined {
+  if (label.length > MAX_RESET_LABEL_LENGTH) return undefined;
   let value = label.replace(/^(?:Resets?|Refreshes?)\s+/i, "").trim();
   let sourceTimeZone: string | undefined;
 
@@ -114,7 +136,7 @@ function parseAbsoluteReset(
     }
   }
 
-  const timeZone = validTimeZone(sourceTimeZone ?? displayTimeZone);
+  const timeZone = validTimeZone(sourceTimeZone ?? fallbackSourceTimeZone);
   if (!timeZone) return undefined;
 
   const monthFirst = value.match(
@@ -170,13 +192,18 @@ function futureWallClock(
   const checkedParts = zonedParts(checkedAt, timeZone);
   if (!checkedParts) return undefined;
   let wallClock = { year: checkedParts.year, month, day, hour, minute };
-  let candidate = instantFromWallClock(wallClock, timeZone);
-  if (!candidate) return undefined;
-  if (candidate.getTime() <= checkedAt.getTime()) {
+  let candidates = instantsFromWallClock(wallClock, timeZone);
+  if (candidates.length === 0) return undefined;
+  const futureCandidate = candidates.find(
+    (candidate) => candidate.getTime() > checkedAt.getTime()
+  );
+  if (futureCandidate) return futureCandidate;
+
+  if (candidates.every((candidate) => candidate.getTime() <= checkedAt.getTime())) {
     wallClock = { ...wallClock, year: wallClock.year + 1 };
-    candidate = instantFromWallClock(wallClock, timeZone);
+    candidates = instantsFromWallClock(wallClock, timeZone);
   }
-  return candidate;
+  return candidates[0];
 }
 
 function nextWallClockTime(
@@ -196,9 +223,14 @@ function nextWallClockTime(
     hour,
     minute,
   };
-  let candidate = instantFromWallClock(wallClock, timeZone);
-  if (!candidate) return undefined;
-  if (candidate.getTime() <= checkedAt.getTime()) {
+  let candidates = instantsFromWallClock(wallClock, timeZone);
+  if (candidates.length === 0) return undefined;
+  const futureCandidate = candidates.find(
+    (candidate) => candidate.getTime() > checkedAt.getTime()
+  );
+  if (futureCandidate) return futureCandidate;
+
+  if (candidates.every((candidate) => candidate.getTime() <= checkedAt.getTime())) {
     const nextDate = new Date(
       Date.UTC(wallClock.year, wallClock.month - 1, wallClock.day + 1)
     );
@@ -208,15 +240,15 @@ function nextWallClockTime(
       month: nextDate.getUTCMonth() + 1,
       day: nextDate.getUTCDate(),
     };
-    candidate = instantFromWallClock(wallClock, timeZone);
+    candidates = instantsFromWallClock(wallClock, timeZone);
   }
-  return candidate;
+  return candidates[0];
 }
 
-function instantFromWallClock(
+function instantsFromWallClock(
   wallClock: WallClock,
   timeZone: string
-): Date | undefined {
+): Date[] {
   const wallAsUtc = Date.UTC(
     wallClock.year,
     wallClock.month - 1,
@@ -224,11 +256,16 @@ function instantFromWallClock(
     wallClock.hour,
     wallClock.minute
   );
-  let guess = wallAsUtc;
+  const candidates = new Map<number, Date>();
 
-  for (let index = 0; index < 3; index += 1) {
-    const represented = zonedParts(new Date(guess), timeZone);
-    if (!represented) return undefined;
+  // A wall-clock time can map to two instants when daylight saving time falls
+  // back. Sample both sides of any nearby offset transition, derive every
+  // plausible instant, and retain only exact wall-clock matches. Sampling a
+  // three-day window also covers current civil offsets from UTC-12 to UTC+14.
+  for (let hours = -36; hours <= 36; hours += 6) {
+    const sample = wallAsUtc + hours * 60 * 60_000;
+    const represented = zonedParts(new Date(sample), timeZone);
+    if (!represented) continue;
     const representedAsUtc = Date.UTC(
       represented.year,
       represented.month - 1,
@@ -236,14 +273,16 @@ function instantFromWallClock(
       represented.hour,
       represented.minute
     );
-    const nextGuess = wallAsUtc - (representedAsUtc - guess);
-    if (nextGuess === guess) break;
-    guess = nextGuess;
+    const candidateTime = wallAsUtc - (representedAsUtc - sample);
+    const candidate = new Date(candidateTime);
+    const verified = zonedParts(candidate, timeZone);
+    if (verified && sameWallClock(verified, wallClock)) {
+      candidates.set(candidateTime, candidate);
+    }
   }
-
-  const candidate = new Date(guess);
-  const verified = zonedParts(candidate, timeZone);
-  return verified && sameWallClock(verified, wallClock) ? candidate : undefined;
+  return [...candidates.values()].sort(
+    (left, right) => left.getTime() - right.getTime()
+  );
 }
 
 function zonedParts(date: Date, timeZone: string): WallClock | undefined {

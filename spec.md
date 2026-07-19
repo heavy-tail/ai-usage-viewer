@@ -702,7 +702,12 @@ A separate scheduled compatibility workflow may run the same full check every
 six hours on a dedicated self-hosted Windows canary. That runner uses isolated
 non-personal test accounts, uploads only the redacted compatibility report,
 opens one tracking issue on drift, and closes it after recovery. Personal OAuth
-state and raw transcripts must never be sent to GitHub-hosted runners.
+state and raw transcripts must never be sent to GitHub-hosted runners. Manual
+baseline acceptance begins in an unprivileged default-branch request workflow;
+the credentialed canary is loaded from the protected default branch and waits
+for approval on the protected environment. Scheduled runs only compare against
+a validated runner-owned baseline. A missing or malformed baseline fails closed
+and cannot be replaced by a scheduled run.
 
 ## Persistence
 

@@ -4,9 +4,23 @@ import { fromRemainingPercent, fromUsedPercent, statusFromPercent } from "../lib
 export type ParserMeta = {
   checkedAt: string;
   sourceCommand: string;
+  // Timezone used by the provider process when output omits an offset. This is
+  // intentionally independent from the user's display timezone.
+  sourceTimeZone?: string;
   planLabel?: string;
   accountLabel?: string;
 };
+
+export function localSourceTimeZone(): string | undefined {
+  try {
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (!timeZone) return undefined;
+    new Intl.DateTimeFormat("en-US", { timeZone }).format();
+    return timeZone;
+  } catch {
+    return undefined;
+  }
+}
 
 export function limitFromUsed(input: {
   id: string;

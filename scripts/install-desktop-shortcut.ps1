@@ -16,7 +16,7 @@ if (-not (Test-Path $LauncherPath)) {
   throw "Launcher script not found: $LauncherPath"
 }
 if (-not (Test-Path $IconPath)) {
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RootDir "scripts/generate-app-icons.ps1")
+  & $PowerShellPath -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RootDir "scripts/generate-app-icons.ps1")
 }
 
 Add-Type -TypeDefinition @'

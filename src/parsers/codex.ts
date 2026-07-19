@@ -1,4 +1,5 @@
 import type { UsageLimit } from "../types";
+import { resolveResetInstant } from "../lib/resetTime";
 import {
   limitFromRemaining,
   limitFromUsed,
@@ -50,6 +51,7 @@ type StructuredBucket = {
   individualLimit?: StructuredIndividualLimit;
   planType?: string;
   rateLimitReachedType?: CodexRateLimitReachedType;
+  spendControlReached?: boolean;
 };
 
 type CodexRateLimitReachedType =
@@ -74,6 +76,7 @@ const STRUCTURED_BUCKET_FIELDS = new Set([
   "individualLimit",
   "planType",
   "rateLimitReachedType",
+  "spendControlReached",
 ]);
 const RATE_LIMIT_REACHED_TYPES = new Set<CodexRateLimitReachedType>([
   "rate_limit_reached",
@@ -128,12 +131,6 @@ export function parseCodexAppServerRateLimits(
   if (containsUsagePercent(root.rateLimitResetCredits)) {
     drift("Codex app-server reset-credit metadata contained usage percentages.");
   }
-  const spendControlReached = optionalBoolean(
-    root.spendControlReached,
-    "result spendControlReached",
-    drift
-  );
-
   const rawMultiBucket = root.rateLimitsByLimitId;
   const multiBucket = objectValue(rawMultiBucket);
   if (rawMultiBucket != null && !multiBucket) {
@@ -142,16 +139,32 @@ export function parseCodexAppServerRateLimits(
 
   const multiBucketEntries = Object.entries(multiBucket ?? {});
   const rawSingleBucket = root.rateLimits;
-  // The documented multi-bucket field is authoritative. Only parse the
-  // backward-compatible single view when the multi-bucket view is absent or
-  // empty, so stale legacy metadata cannot invalidate a complete new response.
+  // The documented multi-bucket field is authoritative for quota windows, but
+  // the compatibility single view can carry a current workspace hard stop.
+  // Parse it even when multi-bucket data exists so a low percentage can never
+  // downgrade an explicit block to "available".
   const singleBucket =
-    multiBucketEntries.length === 0 && rawSingleBucket != null
+    rawSingleBucket != null
       ? parseStructuredBucket(rawSingleBucket, "codex", drift)
       : undefined;
+  const hasBucketSpendControl = multiBucketEntries.some(([, bucket]) =>
+    Object.prototype.hasOwnProperty.call(objectValue(bucket) ?? {}, "spendControlReached")
+  );
+  if (hasBucketSpendControl && root.spendControlReached != null) {
+    drift(
+      "Codex app-server mixed legacy root and current per-bucket spend controls."
+    );
+  }
+  const legacySpendControlReached = hasBucketSpendControl
+    ? undefined
+    : optionalBoolean(
+        root.spendControlReached,
+        "result spendControlReached",
+        drift
+      );
   const buckets = multiBucketEntries.length > 0
     ? multiBucketEntries.map(([mapKey, bucket]) =>
-        parseStructuredBucket(bucket, mapKey, drift)
+        parseStructuredBucket(bucket, mapKey, drift, true)
       )
     : singleBucket
       ? [singleBucket]
@@ -181,7 +194,7 @@ export function parseCodexAppServerRateLimits(
       const baseId = defaultBucket
         ? `codex:${descriptor.id}`
         : `codex:${groupSlug}:${descriptor.id}`;
-      const id = uniqueId(baseId, role, ids);
+      const id = claimUniqueId(baseId, ids, drift);
       const sourceText = JSON.stringify(
         {
           limitId,
@@ -189,7 +202,8 @@ export function parseCodexAppServerRateLimits(
           role,
           ...window,
           rateLimitReachedType: bucket.rateLimitReachedType ?? null,
-          spendControlReached: spendControlReached ?? null,
+          spendControlReached:
+            bucket.spendControlReached ?? legacySpendControlReached ?? null,
         },
         null,
         2
@@ -213,7 +227,8 @@ export function parseCodexAppServerRateLimits(
             meta: bucketMeta,
           }),
           bucket,
-          spendControlReached
+          legacySpendControlReached,
+          singleBucket
         )
       );
     }
@@ -230,7 +245,8 @@ export function parseCodexAppServerRateLimits(
           limitName: limitName ?? null,
           individualLimit: individual,
           rateLimitReachedType: bucket.rateLimitReachedType ?? null,
-          spendControlReached: spendControlReached ?? null,
+          spendControlReached:
+            bucket.spendControlReached ?? legacySpendControlReached ?? null,
         },
         null,
         2
@@ -238,7 +254,7 @@ export function parseCodexAppServerRateLimits(
       limits.push(
         applyHardStop(
           limitFromRemaining({
-            id: uniqueId(baseId, "individual", ids),
+            id: claimUniqueId(baseId, ids, drift),
             provider: "codex",
             providerLabel: "Codex",
             scope: defaultBucket
@@ -253,7 +269,8 @@ export function parseCodexAppServerRateLimits(
             meta: bucketMeta,
           }),
           bucket,
-          spendControlReached
+          legacySpendControlReached,
+          singleBucket
         )
       );
     }
@@ -313,6 +330,7 @@ export function parseCodexFooter(text: string, meta: ParserMeta): UsageLimit[] {
       window: "5h",
       remainingPercent: fiveHourRemaining,
       resetLabel: defaultFiveHour?.resetLabel,
+      resetAt: canonicalTuiResetAt(defaultFiveHour?.resetLabel, effectiveMeta),
       statusLabel: modelLabel,
       sourceText: combineSourceText(footer, defaultFiveHour?.sourceText),
       meta: effectiveMeta,
@@ -325,6 +343,7 @@ export function parseCodexFooter(text: string, meta: ParserMeta): UsageLimit[] {
       window: "weekly",
       remainingPercent: weeklyRemaining,
       resetLabel: defaultWeekly?.resetLabel,
+      resetAt: canonicalTuiResetAt(defaultWeekly?.resetLabel, effectiveMeta),
       statusLabel: modelLabel,
       sourceText: combineSourceText(footer, defaultWeekly?.sourceText),
       meta: effectiveMeta,
@@ -341,6 +360,7 @@ export function parseCodexFooter(text: string, meta: ParserMeta): UsageLimit[] {
         window: statusLimit.window,
         remainingPercent: statusLimit.remainingPercent,
         resetLabel: statusLimit.resetLabel,
+        resetAt: canonicalTuiResetAt(statusLimit.resetLabel, effectiveMeta),
         statusLabel: statusLimit.group,
         sourceText: statusLimit.sourceText,
         meta: effectiveMeta,
@@ -460,7 +480,8 @@ function normalizeResetLabel(value?: string): string | undefined {
 function parseStructuredBucket(
   value: unknown,
   mapKey: string,
-  drift: (message: string) => never
+  drift: (message: string) => never,
+  enforceMapKey = false
 ): StructuredBucket {
   const record = objectValue(value);
   if (!record) drift(`Codex app-server bucket "${mapKey}" was malformed.`);
@@ -476,6 +497,11 @@ function parseStructuredBucket(
   if (!limitId) {
     drift(`Codex app-server bucket "${mapKey}" had an invalid limitId.`);
   }
+  if (enforceMapKey && record.limitId != null && limitId !== mapKey) {
+    drift(
+      `Codex app-server bucket "${mapKey}" did not match limitId "${limitId}".`
+    );
+  }
   const limitName = optionalString(
     record.limitName,
     `bucket "${mapKey}" limitName`,
@@ -489,6 +515,11 @@ function parseStructuredBucket(
   const rateLimitReachedType = optionalRateLimitReachedType(
     record.rateLimitReachedType,
     `bucket "${mapKey}" rateLimitReachedType`,
+    drift
+  );
+  const spendControlReached = optionalBoolean(
+    record.spendControlReached,
+    `bucket "${mapKey}" spendControlReached`,
     drift
   );
   validateCredits(record.credits, mapKey, drift);
@@ -509,6 +540,7 @@ function parseStructuredBucket(
     ),
     planType,
     rateLimitReachedType,
+    spendControlReached,
   };
 }
 
@@ -714,6 +746,17 @@ function resetLabel(value?: number): string | undefined {
   return iso ? `Resets ${iso}` : undefined;
 }
 
+function canonicalTuiResetAt(
+  resetLabel: string | undefined,
+  meta: ParserMeta
+): string | undefined {
+  if (!resetLabel) return undefined;
+  return resolveResetInstant(
+    { checkedAt: meta.checkedAt, resetLabel },
+    meta.sourceTimeZone
+  )?.toISOString();
+}
+
 function resetAt(value?: number): string | undefined {
   if (value == null || value <= 0) return undefined;
   const date = new Date(value * 1_000);
@@ -723,15 +766,29 @@ function resetAt(value?: number): string | undefined {
 function applyHardStop(
   limit: UsageLimit,
   bucket: StructuredBucket,
-  spendControlReached: boolean | undefined
+  legacySpendControlReached: boolean | undefined,
+  singleBucket?: StructuredBucket
 ): UsageLimit {
   const blockingReason = hardStopReason(
-    bucket.rateLimitReachedType,
-    spendControlReached
+    effectiveHardStop(bucket, singleBucket),
+    bucket.spendControlReached ?? legacySpendControlReached
   );
   return blockingReason
     ? { ...limit, status: "exhausted", blockingReason }
     : limit;
+}
+
+function effectiveHardStop(
+  bucket: StructuredBucket,
+  singleBucket?: StructuredBucket
+): CodexRateLimitReachedType | undefined {
+  if (bucket.rateLimitReachedType) return bucket.rateLimitReachedType;
+  const singleStop = singleBucket?.rateLimitReachedType;
+  if (!singleStop) return undefined;
+  if (singleStop.startsWith("workspace_")) return singleStop;
+  return bucket.limitId.toLowerCase() === singleBucket?.limitId.toLowerCase()
+    ? singleStop
+    : undefined;
 }
 
 function hardStopReason(
@@ -754,19 +811,18 @@ function hardStopReason(
   }
 }
 
-function uniqueId(
+function claimUniqueId(
   baseId: string,
-  role: "primary" | "secondary" | "individual",
-  ids: Set<string>
+  ids: Set<string>,
+  drift: (message: string) => never
 ): string {
-  let id = baseId;
-  let suffix = 1;
-  while (ids.has(id)) {
-    id = `${baseId}-${role}${suffix === 1 ? "" : `-${suffix}`}`;
-    suffix += 1;
+  if (ids.has(baseId)) {
+    drift(
+      `Codex app-server returned duplicate semantic quota id "${baseId}".`
+    );
   }
-  ids.add(id);
-  return id;
+  ids.add(baseId);
+  return baseId;
 }
 
 function objectValue(value: unknown): Record<string, unknown> | undefined {

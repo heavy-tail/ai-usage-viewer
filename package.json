@@ -7,7 +7,7 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "build:agy-job-host": "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/build-agy-job-host.ps1",
+    "build:agy-job-host": "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/build-agy-job-host.ps1",
     "predev": "npm run build:agy-job-host",
     "dev": "vite",
     "preapi": "npm run build:agy-job-host",
@@ -18,6 +18,7 @@
     "collect": "tsx src/collect.ts",
     "precompatibility:check": "npm run build:agy-job-host",
     "compatibility:check": "tsx src/checkCompatibility.ts",
+    "compatibility:baseline:validate": "tsx src/validateCompatibilityBaseline.ts",
     "pretest": "npm run build:agy-job-host",
     "test": "vitest run",
     "typecheck": "tsc -b",

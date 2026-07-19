@@ -23,13 +23,12 @@ describe("loadConfig", () => {
     expect(config.enabledProviders).toEqual(DEFAULT_CONFIG.enabledProviders);
   });
 
-  it("filters out unknown providers from enabledProviders", async () => {
+  it("rejects unknown providers instead of silently changing the requested list", async () => {
     const rootDir = await workspace();
     await writeConfig(rootDir, {
       enabledProviders: ["claude", "bogus", "grok"],
     });
-    const config = await loadConfig(rootDir);
-    expect(config.enabledProviders).toEqual(["claude", "grok"]);
+    await expect(loadConfig(rootDir)).rejects.toThrow(/enabledProviders\[1\]/);
   });
 
   it("deep-merges nested provider config with defaults", async () => {
@@ -59,5 +58,24 @@ describe("loadConfig", () => {
     const rootDir = await workspace();
     await mkdir(join(rootDir, "config.json"));
     await expect(loadConfig(rootDir)).rejects.toThrow(/Unable to read/i);
+  });
+
+  it.each([
+    [null, /JSON object/i],
+    [[], /JSON object/i],
+    ['"scalar"', /JSON object/i],
+    [{ enabledProviders: null }, /enabledProviders/i],
+    [{ enabledProviders: "claude" }, /enabledProviders/i],
+    [{ codex: { collectDefault: "false" } }, /codex\.collectDefault/i],
+    [{ codex: { additionalModelsForContext: "gpt" } }, /additionalModelsForContext/i],
+    [{ agy: { pinnedGroups: ["valid", 7] } }, /pinnedGroups\[1\]/i],
+    [{ grokCommand: 42 }, /grokCommand/i],
+    [{ wsl: { cwd: null } }, /wsl\.cwd/i],
+    [{ planLabelFallback: { claude: false } }, /planLabelFallback\.claude/i],
+    [{ unknownSetting: true }, /unknownSetting/i],
+  ])("rejects a wrongly typed or unknown present setting: %j", async (value, message) => {
+    const rootDir = await workspace();
+    await writeConfig(rootDir, value);
+    await expect(loadConfig(rootDir)).rejects.toThrow(message);
   });
 });

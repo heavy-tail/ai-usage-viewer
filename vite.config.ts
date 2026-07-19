@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { trustedForwardedDevelopmentOrigin } from "./src/server/devProxy";
 
 // Local-only dashboard. Bind to 127.0.0.1 per the spec's security section.
 export default defineConfig({
@@ -28,14 +29,14 @@ export default defineConfig({
         target: "http://127.0.0.1:4317",
         changeOrigin: true,
         configure(proxy) {
-          // Production accepts only its exact browser origin. In development,
-          // Vite is the trusted same-machine reverse proxy, so normalize the
-          // forwarded Origin to the backend origin instead of weakening the
-          // production server's check to accept arbitrary loopback ports.
+          // Translate only Vite's exact own origin. An attacker-controlled,
+          // opaque, or malformed Origin remains unchanged and is rejected by
+          // the backend after changeOrigin updates only the Host header.
           proxy.on("proxyReq", (request) => {
-            if (request.getHeader("origin")) {
-              request.setHeader("origin", "http://127.0.0.1:4317");
-            }
+            const forwarded = trustedForwardedDevelopmentOrigin(
+              request.getHeader("origin")
+            );
+            if (forwarded) request.setHeader("origin", forwarded);
           });
         },
       },

@@ -7,9 +7,31 @@ const mocked = vi.hoisted(() => ({
 
 vi.mock("node-pty", () => ({ spawn: mocked.spawn }));
 
-import { runPtyInProcess } from "../src/collectors/pty";
+import {
+  chooseWindowsCommandCandidate,
+  runPtyInProcess,
+} from "../src/collectors/pty";
 
 describe("Windows ConPTY cleanup", () => {
+  it("preserves the command search order reported by Windows", () => {
+    expect(
+      chooseWindowsCommandCandidate([
+        "C:\\FirstOnPath\\provider.exe",
+        "C:\\LaterOnPath\\provider.cmd",
+      ])
+    ).toBe("C:\\FirstOnPath\\provider.exe");
+  });
+
+  it("skips an extensionless Unix shim beside a runnable Windows shim", () => {
+    expect(
+      chooseWindowsCommandCandidate([
+        "C:\\Tools\\provider",
+        "C:\\Tools\\provider.cmd",
+        "C:\\Later\\provider.exe",
+      ])
+    ).toBe("C:\\Tools\\provider.cmd");
+  });
+
   it.skipIf(process.platform !== "win32")(
     "releases the native terminal after the shell exits naturally",
     async () => {
@@ -32,7 +54,7 @@ describe("Windows ConPTY cleanup", () => {
       mocked.spawn.mockReturnValueOnce(terminal);
 
       await runPtyInProcess({
-        command: "fixture.exe",
+        command: process.execPath,
         args: [],
         cwd: process.cwd(),
         totalTimeoutMs: 1_000,

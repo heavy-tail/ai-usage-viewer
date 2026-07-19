@@ -6,6 +6,7 @@ import { ParserDriftError } from "../src/parsers/errors";
 const meta = {
   checkedAt: "2026-07-18T00:00:00.000Z",
   sourceCommand: "fixture",
+  sourceTimeZone: "Asia/Seoul",
 };
 
 describe("provider parser completeness", () => {
@@ -86,35 +87,29 @@ describe("provider parser completeness", () => {
     expect(() => parseGrokUsage(text, meta)).toThrow(ParserDriftError);
   });
 
-  it("uses the latest Grok redraw", () => {
-    const rows = parseGrokUsage(
-      [
-        "Monthly limit: 10% Next reset: July 31, 16:00 PT",
-        "Monthly limit: 30% Next reset: August 31, 16:00 PT",
-      ].join("\n"),
-      meta
-    );
-
-    expect(rows[0]).toMatchObject({
-      usedPercent: 30,
-      resetLabel: "Resets August 31, 16:00 PT",
-    });
+  it("rejects conflicting Grok redraw values", () => {
+    expect(() =>
+      parseGrokUsage(
+        [
+          "Monthly limit: 10% Next reset: July 31, 16:00 PT",
+          "Monthly limit: 30% Next reset: August 31, 16:00 PT",
+        ].join("\n"),
+        meta
+      )
+    ).toThrow(ParserDriftError);
   });
 
-  it("parses Grok's current weekly footer as remaining quota", () => {
-    const rows = parseGrokUsage("[stable] Weekly limit left: 17%", meta);
-
-    expect(rows[0]).toMatchObject({
-      id: "grok:weekly",
-      remainingPercent: 17,
-      usedPercent: 83,
-    });
+  it("does not publish Grok's conditional weekly footer by itself", () => {
+    expect(() =>
+      parseGrokUsage("[stable] Weekly limit left: 17%", meta)
+    ).toThrow(ParserDriftError);
   });
 
   it("publishes separate Grok weekly and monthly rows", () => {
     const rows = parseGrokUsage(
       [
         "Weekly limit left: 17%",
+        "Weekly limit: 83%",
         "Monthly limit: 30% Next reset: August 31, 16:00 PT",
       ].join("\n"),
       meta
@@ -163,6 +158,41 @@ describe("provider parser completeness", () => {
     );
 
     expect(rows[0]).toMatchObject({ id: "grok:weekly", usedPercent: 100 });
+  });
+
+  it("tolerates Grok's token counter glued to a known quota heading", () => {
+    const rows = parseGrokUsage(
+      "2.9K / 500KWeekly limit: 100% Next reset: July 25, 15:12",
+      meta
+    );
+
+    expect(rows[0]).toMatchObject({ id: "grok:weekly", usedPercent: 100 });
+  });
+
+  it("tolerates Grok's erased-cell marker before a known footer", () => {
+    const rows = parseGrokUsage(
+      "X Weekly limit left: 0%\nWeekly limit: 100%",
+      meta
+    );
+
+    expect(rows[0]).toMatchObject({
+      id: "grok:weekly",
+      usedPercent: 100,
+      remainingPercent: 0,
+    });
+  });
+
+  it("tolerates a rotating Grok suggestion before its erased-cell marker", () => {
+    const rows = parseGrokUsage(
+      "/model menu                 X Weekly limit left: 0%\nWeekly limit: 100%",
+      meta
+    );
+
+    expect(rows[0]).toMatchObject({
+      id: "grok:weekly",
+      usedPercent: 100,
+      remainingPercent: 0,
+    });
   });
 
   it("rejects a semantic prefix before a known Grok limit", () => {

@@ -1,7 +1,7 @@
 import * as nodePty from "node-pty";
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { extname, isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { cleanTerminalOutput } from "../lib/terminal";
 import {
@@ -11,6 +11,13 @@ import {
   errorMessage,
 } from "./errors";
 import { runPtyIsolated } from "./ptyIsolated";
+import { WINDOWS_JOB_HOST_PATH } from "./windowsJobHost";
+import {
+  firstRunnableWindowsCommand,
+  trustedChildEnvironment,
+  windowsPtyCommandSpec,
+  windowsSystem32Executable,
+} from "./windowsSystem";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -72,7 +79,11 @@ export const runPtyInProcess: PtyRunner = async (options) => {
   let outputLimitError: PtyProcessError | undefined;
   let exitCode: number | undefined;
   let exited = false;
-  const commandSpec = resolvePtyCommand(options.command, options.args);
+  const commandSpec = resolvePtyCommand(
+    options.command,
+    options.args,
+    options.cwd
+  );
   const responders = options.responders?.map((responder) => ({
     ...responder,
     used: false,
@@ -85,7 +96,7 @@ export const runPtyInProcess: PtyRunner = async (options) => {
       cols: options.cols ?? 160,
       rows: options.rows ?? 40,
       cwd: options.cwd,
-      env: { ...process.env, ...options.env },
+      env: trustedChildEnvironment(options.env),
       // Windows: use ConPTY (the modern pseudo-console) instead of winpty.
       // winpty spawns a `winpty-agent` helper that creates a classic console
       // window before hiding it, which can produce a one-frame flash. ConPTY
@@ -247,7 +258,7 @@ async function terminatePty(
         // falsely healthy. taskkill performs the same bounded tree termination
         // without requiring the parent process to own a Windows console.
         await execFileAsync(
-          "taskkill.exe",
+          windowsSystem32Executable("taskkill.exe"),
           ["/pid", String(terminal.pid), "/T", "/F"],
           { timeout: 3_000, windowsHide: true }
         );
@@ -293,21 +304,39 @@ function suppressNodePtyConsoleProbe(terminal: nodePty.IPty): void {
 
 function resolvePtyCommand(
   command: string,
-  args: string[]
+  args: string[],
+  cwd: string
 ): { command: string; args: string[] } {
   if (process.platform !== "win32") return { command, args };
+  let providerCommand: string;
   if (isAbsolute(command) || command.includes("\\") || command.includes("/")) {
-    return wrapWindowsScript(command, args);
+    providerCommand = isAbsolute(command) ? command : resolve(cwd, command);
+  } else {
+    const resolved = resolveWindowsCommand(command);
+    if (!resolved) {
+      throw new CollectorUnavailableError(
+        `Unable to resolve Windows provider command: ${command}`
+      );
+    }
+    providerCommand = resolved;
   }
 
-  const resolved = resolveWindowsCommand(command);
-  if (!resolved) return { command, args };
-  return wrapWindowsScript(resolved, args);
+  const direct = wrapWindowsScript(providerCommand, args);
+  return {
+    command: WINDOWS_JOB_HOST_PATH,
+    args: [
+      "--interactive",
+      String(process.pid),
+      direct.command,
+      cwd,
+      ...direct.args,
+    ],
+  };
 }
 
 function resolveWindowsCommand(command: string): string | undefined {
   try {
-    const output = execFileSync("where.exe", [command], {
+    const output = execFileSync(windowsSystem32Executable("where.exe"), [command], {
       encoding: "utf8",
       windowsHide: true,
       stdio: ["ignore", "pipe", "ignore"],
@@ -322,31 +351,17 @@ function resolveWindowsCommand(command: string): string | undefined {
   }
 }
 
-function chooseWindowsCommandCandidate(candidates: string[]): string | undefined {
-  return (
-    candidates.find((candidate) => /\.(cmd|bat)$/i.test(candidate)) ??
-    candidates.find((candidate) => /\.exe$/i.test(candidate)) ??
-    candidates[0]
-  );
+export function chooseWindowsCommandCandidate(
+  candidates: string[]
+): string | undefined {
+  return firstRunnableWindowsCommand(candidates);
 }
 
 function wrapWindowsScript(
   command: string,
   args: string[]
 ): { command: string; args: string[] } {
-  const ext = extname(command).toLowerCase();
-  if (ext === ".cmd" || ext === ".bat") {
-    return {
-      command: "cmd.exe",
-      args: ["/d", "/s", "/c", [quoteCmdArg(command), ...args.map(quoteCmdArg)].join(" ")],
-    };
-  }
-  return { command, args };
-}
-
-function quoteCmdArg(value: string): string {
-  if (!/[ \t"&|<>^]/.test(value)) return value;
-  return `"${value.replace(/"/g, '\\"')}"`;
+  return windowsPtyCommandSpec(command, args);
 }
 
 async function waitForPattern(

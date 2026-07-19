@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { displayResetLabel } from "../src/lib/resetTime";
+import { displayResetLabel, resolveResetInstant } from "../src/lib/resetTime";
 
 const options = { locale: "en-US", timeZone: "Asia/Seoul" } as const;
 
@@ -63,7 +63,7 @@ describe("reset time display", () => {
     ).toBe("Resets Jul 19, 4:17 AM");
   });
 
-  it("normalizes legacy Codex local reset labels", () => {
+  it("preserves offset-less labels when their source timezone is unknown", () => {
     expect(
       displayResetLabel(
         {
@@ -72,7 +72,41 @@ describe("reset time display", () => {
         },
         options
       )
-    ).toBe("Resets Jun 4, 3:41 AM");
+    ).toBe("Resets 3:41 AM on 4 Jun");
+  });
+
+  it("canonicalizes an offset-less label with the provider source timezone", () => {
+    const instant = resolveResetInstant(
+      {
+        checkedAt: "2026-07-18T04:00:00.000Z",
+        resetLabel: "Resets 2:39 PM on 18 Jul",
+      },
+      "Asia/Seoul"
+    );
+    expect(instant?.toISOString()).toBe("2026-07-18T05:39:00.000Z");
+    expect(
+      displayResetLabel(
+        {
+          checkedAt: "2026-07-18T04:00:00.000Z",
+          resetAt: instant?.toISOString(),
+          resetLabel: "Resets 2:39 PM on 18 Jul",
+        },
+        { locale: "en-US", timeZone: "UTC" }
+      )
+    ).toBe("Resets Jul 18, 5:39 AM");
+  });
+
+  it("chooses the second matching wall-clock time during a DST fallback", () => {
+    expect(
+      displayResetLabel(
+        {
+          // 1:45 AM PDT, after the first 1:30 but before clocks fall back.
+          checkedAt: "2026-11-01T08:45:00.000Z",
+          resetLabel: "Resets 1:30 AM (America/Los_Angeles)",
+        },
+        { locale: "en-US", timeZone: "UTC" }
+      )
+    ).toBe("Resets Nov 1, 9:30 AM");
   });
 
   it("preserves unknown labels instead of guessing", () => {
@@ -85,5 +119,27 @@ describe("reset time display", () => {
         options
       )
     ).toBe("Resets after billing review");
+  });
+
+  it("does not throw or construct invalid Dates from unbounded reset text", () => {
+    const label = "Resets in 104000000d";
+    expect(() =>
+      displayResetLabel(
+        {
+          checkedAt: "2026-07-18T14:00:00.000Z",
+          resetLabel: label,
+        },
+        options
+      )
+    ).not.toThrow();
+    expect(
+      displayResetLabel(
+        {
+          checkedAt: "2026-07-18T14:00:00.000Z",
+          resetLabel: label,
+        },
+        options
+      )
+    ).toBe(label);
   });
 });

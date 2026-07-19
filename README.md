@@ -106,7 +106,13 @@ removed from the runner workspace after each job. Personal OAuth sessions
 should never be copied into
 GitHub-hosted CI. The runner-owned baseline lives outside the checkout, and the
 `compatibility-canary` GitHub environment should require review before a manual
-baseline replacement can run.
+baseline replacement can run. To intentionally accept a provider-format change,
+run the **Request compatibility baseline acceptance** workflow from `main`, then
+approve the protected `compatibility-canary` environment. The request workflow
+has no repository permissions and the credentialed canary is always loaded from
+the protected default branch. Scheduled comparisons remain read-only and never
+wait for approval; a missing or malformed baseline fails closed instead of being
+silently replaced.
 
 ## Desktop Shortcut
 
@@ -178,12 +184,27 @@ After a `main` run passes, its exact tested commit is bundled and attested. A
 separate workflow loaded from the protected default branch verifies that commit
 is still current, creates the version tag from `package.json`, and publishes the
 same immutable ZIP and checksum through the protected `release` environment.
+The publisher opens the ZIP before tagging and requires its embedded repository,
+exact tested commit, and package version to match; it also rejects releases with
+missing or extra assets.
 Release logic is never loaded from a pushed tag. Bump `package.json` before the
 next release; existing tags and assets are never moved or replaced. The bundle
 contains the built dashboard, local server source, and locked npm manifests; it
 still requires Windows, Node.js 24, and an `npm ci` after extraction. It is not
 a portable installer or an automatic desktop updater yet. Verify a downloaded
 archive with `gh attestation verify <archive> --repo heavy-tail/ai-usage-viewer`.
+
+Repository administrators must protect `main`, require the Windows verification
+check before merge, and configure the `release` environment for protected
+branches with at least one required reviewer and self-review disabled. Those
+GitHub settings are part of the release trust boundary and should be audited
+after any repository-administration change.
+
+A separate GitHub-hosted watchdog checks the provider canary hourly. It opens a
+managed issue if the self-hosted canary is queued or running too long, fails, or
+has no successful scheduled run within ten hours, and closes the issue after
+recovery. This keeps runner outages visible even when the runner itself cannot
+execute its normal issue-sync step.
 
 ## Known Limitations
 

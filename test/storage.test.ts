@@ -72,21 +72,27 @@ describe("storage.writeSnapshot (atomic write)", () => {
     expect(files.filter((name) => name.includes(".tmp"))).toHaveLength(0);
   });
 
-  it("returns null when a stored snapshot is truncated/invalid JSON", async () => {
+  it("surfaces malformed JSON and leaves the stored evidence untouched", async () => {
     const rootDir = await workspace();
     await writeSnapshot(rootDir, sample);
 
-    // Simulate a torn write landing on disk; readSnapshot must not throw.
+    // Simulate a torn write landing on disk.
     await writeFile(
       join(rootDir, "data", "usage-snapshot.json"),
       '{ "generatedAt": "2026',
       "utf8"
     );
 
-    expect(await readSnapshot(rootDir)).toBeNull();
+    await expect(readSnapshot(rootDir)).rejects.toMatchObject({
+      name: "SnapshotStorageError",
+      kind: "malformed",
+    });
+    expect(
+      await readFile(join(rootDir, "data", "usage-snapshot.json"), "utf8")
+    ).toBe('{ "generatedAt": "2026');
   });
 
-  it("returns null when stored JSON has an invalid snapshot shape", async () => {
+  it("distinguishes a schema-invalid snapshot", async () => {
     const rootDir = await workspace();
     await mkdir(join(rootDir, "data"), { recursive: true });
     await writeFile(
@@ -95,7 +101,21 @@ describe("storage.writeSnapshot (atomic write)", () => {
       "utf8"
     );
 
-    expect(await readSnapshot(rootDir)).toBeNull();
+    await expect(readSnapshot(rootDir)).rejects.toMatchObject({
+      name: "SnapshotStorageError",
+      kind: "schema",
+    });
+  });
+
+  it("distinguishes a read failure from a missing snapshot", async () => {
+    const rootDir = await workspace();
+    await mkdir(join(rootDir, "data", "usage-snapshot.json"), {
+      recursive: true,
+    });
+    await expect(readSnapshot(rootDir)).rejects.toMatchObject({
+      name: "SnapshotStorageError",
+      kind: "read",
+    });
   });
 });
 

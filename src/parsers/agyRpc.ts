@@ -11,6 +11,7 @@ const MAX_LABEL_LENGTH = 256;
 const MAX_WINDOW_LENGTH = 128;
 const MAX_ID_LENGTH = 512;
 const MAX_DESCRIPTION_LENGTH = 4_096;
+const RESET_PAST_TOLERANCE_MS = 10 * 60_000;
 const ROOT_FIELDS = new Set(["response"]);
 const RESPONSE_FIELDS = new Set(["description", "groups", "buckets"]);
 const GROUP_FIELDS = new Set(["displayName", "description", "buckets"]);
@@ -201,6 +202,8 @@ export function parseAgyRpcQuota(
       const resetAt = optionalResetTime(
         bucket.resetTime,
         `quota bucket "${groupName}" / "${window}" resetTime`,
+        window,
+        meta.checkedAt,
         throwDrift
       );
       const remainingPercent = roundPercent(remainingFraction * 100);
@@ -312,13 +315,30 @@ function normalizeWindow(rawWindow: string): string {
 function optionalResetTime(
   value: unknown,
   field: string,
+  window: string,
+  checkedAt: string,
   drift: (message: string) => never
 ): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || !isRfc3339(value)) {
     drift(`Agy ${field} was not a valid RFC3339 timestamp.`);
   }
-  return new Date(value).toISOString();
+  const resetMs = Date.parse(value);
+  const checkedMs = Date.parse(checkedAt);
+  if (!Number.isFinite(resetMs) || !Number.isFinite(checkedMs)) {
+    drift(`Agy ${field} could not be compared with the collection time.`);
+  }
+  const delta = resetMs - checkedMs;
+  const maxFutureMs =
+    window === "5h"
+      ? 6 * 60 * 60_000
+      : window === "weekly"
+        ? 8 * 24 * 60 * 60_000
+        : 370 * 24 * 60 * 60_000;
+  if (delta < -RESET_PAST_TOLERANCE_MS || delta > maxFutureMs) {
+    drift(`Agy ${field} was outside the plausible ${window} reset horizon.`);
+  }
+  return new Date(resetMs).toISOString();
 }
 
 function isRfc3339(value: string): boolean {

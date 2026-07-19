@@ -1,3 +1,6 @@
+import { access, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runPty } from "../src/collectors/pty";
 import { PtyProcessError, PtyTimeoutError } from "../src/collectors/errors";
@@ -59,4 +62,26 @@ describe("runPty", () => {
       message: "PTY output exceeded 256 bytes.",
     });
   }, 15_000);
+
+  it.skipIf(process.platform !== "win32")(
+    "kills detached descendants after the PTY command exits naturally",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "usage-viewer-pty-"));
+      const marker = join(directory, "orphan-marker.txt");
+      const fixture = resolve("test", "fixtures", "pty-spawn-descendant.mjs");
+
+      const result = await runPty({
+        command: process.execPath,
+        args: [fixture, marker],
+        cwd: process.cwd(),
+        totalTimeoutMs: 8_000,
+        steps: [{ waitFor: /parent-ready/, timeoutMs: 5_000 }],
+      });
+
+      expect(result.cleanedOutput).toContain("parent-ready");
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 1_300));
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+    15_000
+  );
 });

@@ -108,8 +108,8 @@ describe("refresh service", () => {
     );
   });
 
-  it("runs refresh-all collectors concurrently", async () => {
-    const rootDir = await tempWorkspace(["claude", "codex", "grok"]);
+  it("starts AGY first, then runs terminal collectors concurrently", async () => {
+    const rootDir = await tempWorkspace(["claude", "codex", "agy", "grok"]);
     const service = createRefreshService();
     const events: string[] = [];
 
@@ -118,17 +118,20 @@ describe("refresh service", () => {
       collectors: {
         claude: orderedCollector("claude", events),
         codex: orderedCollector("codex", events),
+        agy: orderedCollector("agy", events),
         grok: orderedCollector("grok", events),
       },
     });
 
-    // All three collectors run; the fact that every "start" precedes any "end"
-    // proves they overlapped rather than running one-at-a-time.
-    expect(events).toHaveLength(6);
-    expect(events.slice(0, 3).every((event) => event.startsWith("start:"))).toBe(
+    expect(events).toHaveLength(8);
+    expect(events.slice(0, 2)).toEqual(["start:agy", "end:agy"]);
+    // Once AGY has established and released its private service, every terminal
+    // collector starts before any of them ends, proving they still overlap.
+    expect(events.slice(2, 5).every((event) => event.startsWith("start:"))).toBe(
       true
     );
     expect(events.filter((event) => event.startsWith("start:")).sort()).toEqual([
+      "start:agy",
       "start:claude",
       "start:codex",
       "start:grok",
@@ -383,14 +386,14 @@ describe("refresh service", () => {
       ok: false,
       state: "stale",
       attemptState: "drift",
-      adapterVersion: "2.2.0",
+      adapterVersion: "2.6.0",
       error: expect.stringContaining("Adapter contract rejected"),
     });
     expect(snapshot.limits).toHaveLength(1);
     expect(snapshot.limits[0].id).toBe("claude:limit");
   });
 
-  it("marks an otherwise healthy refresh when quota row identities change", async () => {
+  it("keeps the last verified rows when quota row identities change", async () => {
     const rootDir = await tempWorkspace(["claude"]);
     const service = createRefreshService();
 
@@ -411,14 +414,225 @@ describe("refresh service", () => {
 
     expect(snapshot.collectors.find((item) => item.provider === "claude"))
       .toMatchObject({
-        ok: true,
-        state: "ok",
+        ok: false,
+        state: "stale",
+        attemptState: "drift",
         rowInventoryChanged: true,
       });
+    expect(snapshot.limits).toEqual([
+      expect.objectContaining({
+        id: "claude:limit",
+        freshness: "stale",
+      }),
+    ]);
     const report = JSON.parse(
       await readFile(join(rootDir, "data", "compatibility-report.json"), "utf8")
     ) as { passed: boolean };
     expect(report.passed).toBe(false);
+  });
+
+  it("accepts Claude's conditionally omitted model-specific row", async () => {
+    const rootDir = await tempWorkspace(["claude"]);
+    const service = createRefreshService();
+    const core = limit("claude");
+
+    await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () =>
+          okResult("claude", [
+            core,
+            {
+              ...core,
+              id: "claude:week-fable",
+              scope: "Current week (Fable)",
+              window: "weekly",
+            },
+          ]),
+      },
+    });
+    const snapshot = await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => okResult("claude", [core]),
+      },
+    });
+
+    expect(snapshot.collectors.find((item) => item.provider === "claude"))
+      .toMatchObject({
+        ok: true,
+        state: "ok",
+        rowInventoryChanged: false,
+        formatChanged: false,
+      });
+    expect(snapshot.limits.map((row) => row.id)).toEqual(["claude:limit"]);
+  });
+
+  it("keeps the last verified rows when the provider format changes", async () => {
+    const rootDir = await tempWorkspace(["claude"]);
+    const service = createRefreshService();
+
+    await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => okResult("claude", [limit("claude")]),
+      },
+    });
+
+    const snapshot = await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => ({
+          ...okResult("claude", [
+            {
+              ...limit("claude"),
+              usedPercent: 40,
+              remainingPercent: 60,
+              sourceText: "a structurally different provider layout",
+            },
+          ]),
+          rawText: "a structurally different provider layout",
+          cleanedText: "a structurally different provider layout",
+        }),
+      },
+    });
+
+    expect(snapshot.collectors.find((item) => item.provider === "claude"))
+      .toMatchObject({
+        ok: false,
+        state: "stale",
+        attemptState: "drift",
+        formatChanged: true,
+      });
+    expect(snapshot.limits).toEqual([
+      expect.objectContaining({
+        id: "claude:limit",
+        usedPercent: 10,
+        remainingPercent: 90,
+        freshness: "stale",
+      }),
+    ]);
+  });
+
+  it("publishes validated rows from an intentional adapter upgrade while flagging canary acceptance", async () => {
+    const rootDir = await tempWorkspace(["claude"]);
+    const service = createRefreshService();
+
+    await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => okResult("claude", [limit("claude")]),
+      },
+    });
+    const snapshotPath = join(rootDir, "data", "usage-snapshot.json");
+    const previous = JSON.parse(await readFile(snapshotPath, "utf8")) as {
+      collectors: Array<{ provider: string; adapterVersion?: string }>;
+    };
+    const previousClaude = previous.collectors.find(
+      (collector) => collector.provider === "claude"
+    );
+    if (!previousClaude) throw new Error("Claude fixture health is missing.");
+    previousClaude.adapterVersion = "2.2.0";
+    await writeFile(snapshotPath, JSON.stringify(previous), "utf8");
+
+    const snapshot = await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => ({
+          ...okResult("claude", [
+            { ...limit("claude"), id: "claude:new-limit" },
+          ]),
+          rawText: "new adapter layout",
+          cleanedText: "new adapter layout",
+        }),
+      },
+    });
+
+    expect(snapshot.collectors.find((item) => item.provider === "claude"))
+      .toMatchObject({
+        ok: true,
+        state: "ok",
+        formatChanged: true,
+        rowInventoryChanged: true,
+      });
+    expect(snapshot.limits).toEqual([
+      expect.objectContaining({
+        id: "claude:new-limit",
+        freshness: "verified",
+      }),
+    ]);
+    const report = JSON.parse(
+      await readFile(join(rootDir, "data", "compatibility-report.json"), "utf8")
+    ) as { passed: boolean };
+    expect(report.passed).toBe(false);
+  });
+
+  it("does not consume an adapter upgrade when its first attempt fails", async () => {
+    const rootDir = await tempWorkspace(["claude"]);
+    const service = createRefreshService();
+
+    await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => okResult("claude", [limit("claude")]),
+      },
+    });
+    const snapshotPath = join(rootDir, "data", "usage-snapshot.json");
+    const previous = JSON.parse(await readFile(snapshotPath, "utf8")) as {
+      collectors: Array<{
+        provider: string;
+        adapterVersion?: string;
+        formatFingerprint?: string;
+      }>;
+    };
+    const previousClaude = previous.collectors.find(
+      (collector) => collector.provider === "claude"
+    );
+    if (!previousClaude) throw new Error("Claude fixture health is missing.");
+    previousClaude.adapterVersion = "2.3.0";
+    const verifiedFingerprint = previousClaude.formatFingerprint;
+    await writeFile(snapshotPath, JSON.stringify(previous), "utf8");
+
+    const failed = await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => ({
+          provider: "claude",
+          ok: false,
+          state: "drift",
+          checkedAt: "2026-06-03T12:00:01.000Z",
+          durationMs: 20,
+          limits: [],
+          rawText: "incomplete upgraded frame",
+          cleanedText: "incomplete upgraded frame",
+          rawFileName: "claude.txt",
+          error: "upgraded parser rejected an incomplete frame",
+        }),
+      },
+    });
+    expect(failed.collectors.find((item) => item.provider === "claude"))
+      .toMatchObject({
+        state: "stale",
+        adapterVersion: "2.3.0",
+        formatFingerprint: verifiedFingerprint,
+      });
+
+    const recovered = await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => ({
+          ...okResult("claude", [limit("claude")]),
+          rawText: "repaired upgraded layout",
+          cleanedText: "repaired upgraded layout",
+        }),
+      },
+    });
+    expect(recovered.collectors.find((item) => item.provider === "claude"))
+      .toMatchObject({
+        ok: true,
+        state: "ok",
+        adapterVersion: "2.6.0",
+      });
   });
 
   it("drops legacy Grok pay-as-you-go details from stale labels", async () => {

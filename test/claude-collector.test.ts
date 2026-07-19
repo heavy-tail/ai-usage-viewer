@@ -26,9 +26,21 @@ describe("Claude collector compatibility", () => {
     expect(options.totalTimeoutMs).toBeGreaterThanOrEqual(45_000);
     expect(options.steps).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ optional: true, waitFor: expect.any(RegExp) }),
+        expect.objectContaining({
+          optional: true,
+          waitFor: expect.any(RegExp),
+          delayMs: 250,
+        }),
       ])
     );
+    expect(
+      options.steps.some(
+        (step) =>
+          step.optional === true &&
+          step.waitFor instanceof RegExp &&
+          step.waitFor.test("What's contributing to your limits usage?")
+      )
+    ).toBe(true);
   });
 
   it("falls back to the legacy interactive output on older CLI versions", async () => {
@@ -66,17 +78,17 @@ function successfulPty(): PtyRunner {
 
 function context(ptyRunner: PtyRunner, supportsFlatOutput: boolean): CollectorContext {
   const commandRunner: CommandRunner = async (command, args) => {
-    if (command === "where.exe") {
+    if (command.toLowerCase().endsWith("\\where.exe")) {
       return { stdout: "claude.cmd\n", stderr: "", exitCode: 0 };
     }
-    if (command === "claude" && args[0] === "auth") {
+    if (/claude(?:\.exe|\.cmd)?$/i.test(command) && args[0] === "auth") {
       return {
         stdout: "loggedIn: true\nsubscriptionType: max\n",
         stderr: "",
         exitCode: 0,
       };
     }
-    if (command === "claude" && args[0] === "--help") {
+    if (/claude(?:\.exe|\.cmd)?$/i.test(command) && args[0] === "--help") {
       return {
         stdout: supportsFlatOutput
           ? "Options:\n  --ax-screen-reader  Render flat text"

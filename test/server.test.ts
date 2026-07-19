@@ -158,7 +158,7 @@ describe("usage server routes", () => {
     });
   });
 
-  it("GET /api/snapshot safely falls back when the stored shape is invalid", async () => {
+  it("GET /api/snapshot surfaces storage corruption instead of an empty state", async () => {
     const rootDir = await workspace();
     await writeFile(
       join(rootDir, "data", "usage-snapshot.json"),
@@ -167,12 +167,9 @@ describe("usage server routes", () => {
     );
     await withServer({ rootDir, refresh: okRefresh }, async (base) => {
       const res = await fetch(`${base}/api/snapshot`);
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { snapshot: UsageSnapshot };
-      expect(body.snapshot.collectors).toHaveLength(4);
-      expect(body.snapshot.collectors.every((collector) => collector.state === "stale"))
-        .toBe(true);
-      expect(body.snapshot.limits).toEqual([]);
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toMatch(/could not complete/i);
     });
   });
 

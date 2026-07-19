@@ -3,13 +3,13 @@ name: Provider Compatibility Canary
 on:
   schedule:
     - cron: "17 */6 * * *"
-  workflow_dispatch:
-    inputs:
-      accept_baseline:
-        description: "Replace the protected baseline after an intentional adapter update"
-        required: false
-        type: boolean
-        default: false
+  # Manual acceptance is requested through a separate, unprivileged workflow.
+  # workflow_run always loads this privileged workflow from the default branch,
+  # so a manually selected feature ref can never rewrite the runner logic.
+  workflow_run:
+    workflows: ["Request compatibility baseline acceptance"]
+    types: [completed]
+    branches: [main]
 
 # Never run two PTY canaries against the same provider test profile at once.
 concurrency:
@@ -22,6 +22,12 @@ permissions:
 jobs:
   compatibility:
     name: Check live provider compatibility
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.head_branch == github.event.repository.default_branch)
     # SECURITY: this custom label belongs only on a dedicated Windows runner
     # whose service-account profile is authenticated to NON-PERSONAL provider
     # test accounts. Never attach it to a developer workstation or personal
@@ -30,7 +36,7 @@ jobs:
     # Configure required reviewers only on `compatibility-canary`. Scheduled
     # read-only comparisons use the unprotected environment so they never wait
     # for a human every six hours.
-    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.accept_baseline && 'compatibility-canary' || 'compatibility-canary-readonly' }}
+    environment: ${{ github.event_name == 'workflow_run' && 'compatibility-canary' || 'compatibility-canary-readonly' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -40,6 +46,7 @@ jobs:
       - name: Check out repository without persisting credentials
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
           persist-credentials: false
 
       - name: Set up Node.js
@@ -93,7 +100,7 @@ jobs:
       - name: Restore protected compatibility baseline
         shell: pwsh
         env:
-          ACCEPT_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.accept_baseline && 'true' || 'false' }}
+          ACCEPT_BASELINE: ${{ github.event_name == 'workflow_run' && 'true' || 'false' }}
         run: |
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
           if (-not $env:USAGE_VIEWER_CANARY_BASELINE) {
@@ -109,7 +116,7 @@ jobs:
             exit 0
           }
           if (-not (Test-Path -LiteralPath $baseline -PathType Leaf)) {
-            throw "No protected compatibility baseline exists. Run workflow_dispatch once with accept_baseline enabled."
+            throw "No protected compatibility baseline exists. Run 'Request compatibility baseline acceptance' and approve the protected canary environment once."
           }
           New-Item -ItemType Directory -Force -Path (Join-Path $workspace "data") | Out-Null
           Copy-Item -LiteralPath $baseline -Destination (Join-Path $workspace "data/usage-snapshot.json") -ErrorAction Stop
@@ -119,15 +126,27 @@ jobs:
         continue-on-error: true
         run: npm ci
 
+      - name: Validate restored protected baseline
+        id: baseline_validation
+        if: github.event_name != 'workflow_run' && steps.dependencies.outcome == 'success'
+        continue-on-error: true
+        run: npm run compatibility:baseline:validate
+
       - name: Run live compatibility check
         id: canary
-        if: steps.dependencies.outcome == 'success'
+        if: >-
+          steps.dependencies.outcome == 'success' &&
+          (github.event_name == 'workflow_run' ||
+           steps.baseline_validation.outcome == 'success')
         continue-on-error: true
         run: npm run compatibility:check
 
       - name: Persist successful protected baseline
         id: baseline
-        if: steps.dependencies.outcome == 'success' && steps.canary.outcome == 'success'
+        if: >-
+          github.event_name == 'workflow_run' &&
+          steps.dependencies.outcome == 'success' &&
+          steps.canary.outcome == 'success'
         shell: pwsh
         run: |
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
@@ -161,7 +180,9 @@ jobs:
         if: always()
         shell: pwsh
         env:
+          ACCEPT_BASELINE: ${{ github.event_name == 'workflow_run' && 'true' || 'false' }}
           DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
+          BASELINE_VALIDATION_OUTCOME: ${{ steps.baseline_validation.outcome }}
           CANARY_OUTCOME: ${{ steps.canary.outcome }}
           BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -198,10 +219,21 @@ jobs:
             })
           }
 
+          $baselinePassed = if ($env:ACCEPT_BASELINE -eq "true") {
+            $env:BASELINE_OUTCOME -eq "success"
+          } else {
+            $env:BASELINE_OUTCOME -eq "skipped"
+          }
+          $baselineValidationPassed = if ($env:ACCEPT_BASELINE -eq "true") {
+            $env:BASELINE_VALIDATION_OUTCOME -eq "skipped"
+          } else {
+            $env:BASELINE_VALIDATION_OUTCOME -eq "success"
+          }
           $commandPassed =
             $env:DEPENDENCY_OUTCOME -eq "success" -and
+            $baselineValidationPassed -and
             $env:CANARY_OUTCOME -eq "success" -and
-            $env:BASELINE_OUTCOME -eq "success"
+            $baselinePassed
           $reportPassed = $null -ne $source -and [bool] $source.passed
           $expectedProviders = @("claude", "codex", "agy", "grok")
           $actualProviders = @($providers | ForEach-Object { [string] $_.provider })
@@ -241,12 +273,13 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          CANARY_FAILED: ${{ steps.dependencies.outcome != 'success' || steps.canary.outcome != 'success' || steps.baseline.outcome != 'success' || steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success' }}
+          CANARY_FAILED: ${{ steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success' }}
           DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
+          BASELINE_VALIDATION_OUTCOME: ${{ steps.baseline_validation.outcome }}
           CANARY_OUTCOME: ${{ steps.canary.outcome }}
           BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
         run: |
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
@@ -319,6 +352,7 @@ jobs:
 
           - **Latest result:** $result
           - **Dependency install:** $env:DEPENDENCY_OUTCOME
+          - **Protected baseline validation:** $env:BASELINE_VALIDATION_OUTCOME
           - **Compatibility command:** $env:CANARY_OUTCOME
           - **Protected baseline:** $env:BASELINE_OUTCOME
           - **Commit:** ``$env:COMMIT_SHA``
@@ -405,6 +439,6 @@ jobs:
           }
 
       - name: Fail after recording a canary failure
-        if: always() && (steps.dependencies.outcome != 'success' || steps.canary.outcome != 'success' || steps.baseline.outcome != 'success' || steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success')
+        if: always() && (steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success')
         shell: pwsh
         run: throw "Provider compatibility canary failed; the managed issue and redacted artifact were updated."

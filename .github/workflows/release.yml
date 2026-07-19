@@ -86,18 +86,86 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t checksum_files < <(find release -maxdepth 1 -type f -name '*.sha256' -print | sort)
-          mapfile -t archive_files < <(find release -maxdepth 1 -type f -name '*.zip' -print | sort)
-          if [[ ${#checksum_files[@]} -ne 1 || ${#archive_files[@]} -ne 1 ]]; then
-            echo "Expected exactly one ZIP and one checksum file." >&2
+          version="${RELEASE_TAG#v}"
+          safe_version="$(printf '%s' "$version" | sed 's/[^A-Za-z0-9._-]/-/g')"
+          expected_archive="usage-viewer-$safe_version-windows-node.zip"
+          expected_checksum="$expected_archive.sha256"
+          mapfile -t artifact_entries < <(
+            find release -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+          )
+          if [[ ${#artifact_entries[@]} -ne 2 ||
+                "${artifact_entries[0]}" != "$expected_archive" ||
+                "${artifact_entries[1]}" != "$expected_checksum" ]]; then
+            printf 'Unexpected CI artifact inventory:\n%s\n' "${artifact_entries[*]:-<empty>}" >&2
             exit 1
           fi
 
-          checksum_file="${checksum_files[0]}"
-          archive_file="${archive_files[0]}"
-          checksum_name="$(basename "$checksum_file")"
-          archive_name="$(basename "$archive_file")"
-          (cd release && sha256sum --check "$checksum_name")
+          archive_file="release/$expected_archive"
+          checksum_file="release/$expected_checksum"
+          checksum_line="$(tr -d '\r\n' < "$checksum_file")"
+          recorded_hash="${checksum_line%% *}"
+          if [[ ! "$recorded_hash" =~ ^[0-9a-f]{64}$ ||
+                "$checksum_line" != "$recorded_hash *$expected_archive" ]]; then
+            echo "The checksum file has an invalid or unexpected target." >&2
+            exit 1
+          fi
+          actual_hash="$(sha256sum "$archive_file" | awk '{print $1}')"
+          if [[ "$actual_hash" != "$recorded_hash" ]]; then
+            echo "The deployment archive does not match its checksum." >&2
+            exit 1
+          fi
+
+          python3 - \
+            "$archive_file" \
+            "$version" \
+            "$TESTED_SHA" \
+            "$GITHUB_REPOSITORY" <<'PY'
+          import json
+          import pathlib
+          import sys
+          import zipfile
+
+          archive, version, tested_sha, repository = sys.argv[1:]
+          package_name = "usage-viewer/package.json"
+          provenance_name = "usage-viewer/BUILD-PROVENANCE.json"
+          with zipfile.ZipFile(archive) as bundle:
+              names = bundle.namelist()
+              if len(names) != len(set(names)):
+                  raise SystemExit("The deployment archive contains duplicate entries.")
+              for name in names:
+                  path = pathlib.PurePosixPath(name)
+                  if (
+                      not name.startswith("usage-viewer/")
+                      or name.startswith("/")
+                      or "\\" in name
+                      or ".." in path.parts
+                  ):
+                      raise SystemExit(f"Unsafe deployment archive entry: {name}")
+              if names.count(package_name) != 1 or names.count(provenance_name) != 1:
+                  raise SystemExit("The deployment archive is missing unique metadata files.")
+              package = json.loads(bundle.read(package_name))
+              provenance = json.loads(bundle.read(provenance_name))
+
+          expected = {
+              "schemaVersion": 1,
+              "sourceRepository": repository,
+              "sourceCommit": tested_sha,
+              "packageVersion": version,
+          }
+          if package.get("version") != version:
+              raise SystemExit("The archived package version does not match the release tag.")
+          if provenance != expected:
+              raise SystemExit("The archived provenance does not match the exact tested commit.")
+          PY
+
+          # Artifact verification can take long enough for a newer main commit
+          # to land. Re-check immediately before creating release authority.
+          git fetch --no-tags origin main
+          current_main="$(git rev-parse origin/main)"
+          if [[ "$TESTED_SHA" != "$current_main" ]]; then
+            echo "Main advanced during artifact verification; the newer CI run owns the release." >&2
+            exit 1
+          fi
 
           remote_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')"
           if [[ -z "$remote_tag" ]]; then
@@ -109,17 +177,33 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          verify_published_release() {
+            mapfile -t published_assets < <(
+              gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+                --jq '.assets[].name' | sort
+            )
+            if [[ ${#published_assets[@]} -ne 2 ||
+                  "${published_assets[0]}" != "$expected_archive" ||
+                  "${published_assets[1]}" != "$expected_checksum" ]]; then
+              printf 'Unexpected published release assets:\n%s\n' "${published_assets[*]:-<empty>}" >&2
+              return 1
+            fi
+
             published="$(mktemp -d)"
-            trap 'rm -rf "$published"' EXIT
             gh release download "$RELEASE_TAG" \
-              --pattern "$checksum_name" \
-              --pattern "$archive_name" \
+              --pattern "$expected_archive" \
+              --pattern "$expected_checksum" \
               --dir "$published"
-            cmp -s "$checksum_file" "$published/$checksum_name"
-            (cd "$published" && sha256sum --check "$checksum_name")
-            echo "Release already exists with identical immutable assets."
+            cmp -s "$archive_file" "$published/$expected_archive"
+            cmp -s "$checksum_file" "$published/$expected_checksum"
+            rm -rf "$published"
+          }
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            verify_published_release
+            echo "Release already exists with identical immutable assets and no extras."
           else
             gh release create "$RELEASE_TAG" "$archive_file" "$checksum_file" \
               --verify-tag --generate-notes --title "AI Usage Viewer $RELEASE_TAG"
+            verify_published_release
           fi

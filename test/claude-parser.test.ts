@@ -24,7 +24,7 @@ describe("Claude usage compatibility", () => {
       scope: "Current session",
       window: "session",
       usedPercent: 17,
-      resetLabel: "Resets 1:23am (Fixture/UTC)",
+      resetLabel: "Resets 1:23pm (UTC)",
     });
     expect(pick(limits, "claude:week-all")).toMatchObject({
       scope: "Current week (all models)",
@@ -87,6 +87,94 @@ describe("Claude usage compatibility", () => {
     const limits = parseClaudeUsage(`${first}\n${second}`, meta);
 
     expect(pick(limits, "claude:session").usedPercent).toBe(7);
+  });
+
+  it("ignores a glued heading in an older redraw when the newest frame is complete", () => {
+    const older = usageText([
+      "Esc to cancelCurrent week (Fable)",
+      "96% 96% used",
+      "Resets Jul 21, 3:59pm (Asia/Seoul)",
+    ]);
+    const newest = usageText([
+      "Current week (Fable)",
+      "96% 96% used",
+      "Resets Jul 21, 3:59pm (Asia/Seoul)",
+    ]);
+
+    const limits = parseClaudeUsage(`${older}\n${newest}`, meta);
+
+    expect(pick(limits, "claude:week-fable").usedPercent).toBe(96);
+  });
+
+  it("canonicalizes harmless progress-bar redraw differences", () => {
+    const plain = parseClaudeUsage(usageText([]), meta);
+    const duplicatedCell = parseClaudeUsage(
+      usageText([]).replace("3% used", "3% 3% used"),
+      meta
+    );
+
+    expect(pick(duplicatedCell, "claude:session").sourceText).toBe(
+      pick(plain, "claude:session").sourceText
+    );
+  });
+
+  it("reconstructs Claude's observed in-place session redraw", () => {
+    const initial = usageText([]).replace("3% used", "25% 25% used");
+    const updated = [
+      "Esc to cancel26% 26% used",
+      "Resets 3:10am (Asia/Seoul)",
+      "Current week (all models)",
+      "60% 60% used",
+      "Resets Jul 20, 4pm (Asia/Seoul)",
+      "Current week (Fable)",
+      "97% 97% used",
+      "Resets Jul 21, 3:59pm (Asia/Seoul)",
+      "Usage credits",
+      "Usage credits are off",
+    ].join("\n");
+
+    const limits = parseClaudeUsage(`${initial}\n${updated}`, meta);
+
+    expect(pick(limits, "claude:session").usedPercent).toBe(26);
+    expect(pick(limits, "claude:week-all").usedPercent).toBe(60);
+    expect(pick(limits, "claude:week-fable").usedPercent).toBe(97);
+  });
+
+  it("uses the last credits-complete frame before Claude's exit redraw", () => {
+    const complete = usageText([
+      "Current week (Fable)",
+      "98% used",
+      "Resets Jul 21, 3:59pm (Asia/Seoul)",
+      "Usage credits",
+      "Usage credits are off",
+      "Esc to cancel60% 60% used",
+      "Resets Jul 20, 4pm (Asia/Seoul)",
+    ]);
+    const exitRedraw = [
+      "Current session",
+      "28% used",
+      "Resets 3:10am (Asia/Seoul)",
+      "Current week (all models)",
+      "60% used",
+      "Resets Jul 20, 4pm (Asia/Seoul)",
+      "What's contributing to your limits usage?",
+    ].join("\n");
+
+    const limits = parseClaudeUsage(`${complete}\n${exitRedraw}`, meta);
+
+    expect(pick(limits, "claude:week-fable").usedPercent).toBe(98);
+  });
+
+  it("does not hide a new percentage section after usage credits", () => {
+    const text = usageText([
+      "Usage credits",
+      "Usage credits are off",
+      "Current month (all models)",
+      "12% used",
+      "Resets Aug 1, 4pm (Asia/Seoul)",
+    ]);
+
+    expect(() => parseClaudeUsage(text, meta)).toThrow(ParserDriftError);
   });
 
   it("accepts disabled usage credits and keeps the latest live redraw", () => {

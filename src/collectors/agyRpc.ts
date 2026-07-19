@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import { open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { WINDOWS_JOB_HOST_PATH } from "./windowsJobHost";
+import { trustedChildEnvironment } from "./windowsSystem";
 
 export const AGY_QUOTA_RPC_PATH =
   "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
@@ -15,9 +16,6 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 3_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_MAX_LOG_BYTES = 1024 * 1024;
 const MAX_DISCOVERY_BYTES = 64 * 1024;
-const AGY_JOB_HOST_PATH = fileURLToPath(
-  new URL("../../.runtime/agy-job-host.exe", import.meta.url)
-);
 
 export type AgyRpcResult = {
   payload: unknown;
@@ -103,6 +101,7 @@ export async function readAgyQuotaRpc(
         // A separate process group lets Unix tear down the exact descendant
         // tree. Windows uses taskkill /T against the exact PID below.
         detached: process.platform !== "win32",
+        env: trustedChildEnvironment(),
       }
     );
     state = observeProcess(child);
@@ -147,8 +146,11 @@ function launchSpec(
     );
   }
   return {
-    command: AGY_JOB_HOST_PATH,
-    args: [settings.command, settings.cwd, ...agyArgs],
+    command: WINDOWS_JOB_HOST_PATH,
+    // AGY may create a top-level window even when CREATE_NO_WINDOW and
+    // SW_HIDE are supplied. Start it on a private inherited Windows desktop so
+    // no provider-owned window can ever reach the user's visible desktop.
+    args: ["--hidden", settings.command, settings.cwd, ...agyArgs],
     closeStdinAfterSpawn: false,
   };
 }

@@ -12,6 +12,10 @@ import {
   type SerializedPtyError,
 } from "./ptyProtocol";
 import type { PtyRunner } from "./pty";
+import {
+  trustedChildEnvironment,
+  windowsSystem32Executable,
+} from "./windowsSystem";
 
 const execFileAsync = promisify(execFile);
 const WORKER_PATH = fileURLToPath(new URL("./ptyWorker.ts", import.meta.url));
@@ -26,6 +30,7 @@ export const runPtyIsolated: PtyRunner = (options) =>
         cwd: PACKAGE_ROOT,
         windowsHide: true,
         stdio: ["ignore", "ignore", "ignore", "ipc"],
+        env: trustedChildEnvironment(),
       });
     } catch (error) {
       reject(
@@ -134,7 +139,7 @@ async function terminateWorker(worker: ChildProcess): Promise<void> {
   if (process.platform === "win32" && worker.pid) {
     try {
       await execFileAsync(
-        "taskkill.exe",
+        windowsSystem32Executable("taskkill.exe"),
         ["/pid", String(worker.pid), "/T", "/F"],
         { timeout: 5_000, windowsHide: true }
       );

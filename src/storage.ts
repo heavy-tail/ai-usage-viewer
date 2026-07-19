@@ -9,14 +9,44 @@ const SNAPSHOT_FILE = join("data", "usage-snapshot.json");
 const RAW_DIR = join("data", "raw");
 const COMPATIBILITY_REPORT_FILE = join("data", "compatibility-report.json");
 
-export async function readSnapshot(rootDir: string): Promise<UsageSnapshot | null> {
-  try {
-    const text = await readFile(join(rootDir, SNAPSHOT_FILE), "utf8");
-    const parsed: unknown = JSON.parse(text);
-    return validateSnapshotShape(parsed) ? parsed : null;
-  } catch {
-    return null;
+export class SnapshotStorageError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "read" | "malformed" | "schema"
+  ) {
+    super(message);
+    this.name = "SnapshotStorageError";
   }
+}
+
+export async function readSnapshot(rootDir: string): Promise<UsageSnapshot | null> {
+  let text: string;
+  try {
+    text = await readFile(join(rootDir, SNAPSHOT_FILE), "utf8");
+  } catch (error) {
+    if (isMissingFileError(error)) return null;
+    throw new SnapshotStorageError(
+      "The stored usage snapshot could not be read.",
+      "read"
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    throw new SnapshotStorageError(
+      "The stored usage snapshot contains malformed JSON and was left untouched.",
+      "malformed"
+    );
+  }
+  if (!validateSnapshotShape(parsed)) {
+    throw new SnapshotStorageError(
+      "The stored usage snapshot has an invalid schema and was left untouched.",
+      "schema"
+    );
+  }
+  return parsed;
 }
 
 export async function writeSnapshot(
@@ -57,4 +87,13 @@ export async function purgeRawOutputs(rootDir: string): Promise<void> {
 export function rawFileNameForProvider(provider: UsageProvider): string {
   if (provider === "codex") return "codex-default.txt";
   return `${provider}.txt`;
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
 }

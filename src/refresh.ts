@@ -23,7 +23,10 @@ import {
   writeSnapshot,
 } from "./storage";
 import { buildStaleStatusLabel } from "./lib/staleLabel";
-import { verifyCollectorResult } from "./compatibility";
+import {
+  isConditionallyReportedLimit,
+  verifyCollectorResult,
+} from "./compatibility";
 import { buildCompatibilityReport } from "./compatibilityReport";
 import { tryAcquireRefreshLock } from "./refreshLock";
 
@@ -97,19 +100,26 @@ async function runLockedRefresh(
     commandRunner: runCommand,
   };
 
-  // Collectors are independent (each drives its own CLI / PTY), so run them
-  // concurrently: total refresh time then tracks the slowest provider instead of
-  // the sum of all four. Each provider still fails in isolation
-  // (runProviderCollector never throws), and health/rows are merged below in
-  // deterministic PROVIDER_ORDER, so output ordering is unaffected.
-  const collected = await Promise.all(
-    providersToRun.map(async (provider) => {
-      const result = enabled.has(provider)
-        ? await runProviderCollector(provider, collectorMap[provider], context)
-        : disabledResult(provider);
-      return [provider, result] as const;
-    })
+  const collectProvider = async (provider: UsageProvider) => {
+    const result = enabled.has(provider)
+      ? await runProviderCollector(provider, collectorMap[provider], context)
+      : disabledResult(provider);
+    return [provider, result] as const;
+  };
+
+  // AGY's local language service is sensitive to simultaneous cold starts of
+  // the three terminal-based CLIs on Windows. Start its structured RPC service
+  // first, then keep Claude/Codex/Grok concurrent. This adds only AGY's normal
+  // few-second startup while avoiding a 45-second false timeout and stale row.
+  const agyResult = providersToRun.includes("agy")
+    ? [await collectProvider("agy")]
+    : [];
+  const otherResults = await Promise.all(
+    providersToRun
+      .filter((provider) => provider !== "agy")
+      .map(collectProvider)
   );
+  const collected = [...agyResult, ...otherResults];
   const results = new Map<UsageProvider, ProviderCollectorResult>(collected);
 
   const collectors: CollectorHealth[] = [];
@@ -124,15 +134,14 @@ async function runLockedRefresh(
     );
 
     if (result) {
-      collectors.push(
-        healthFromResult(
-          result,
-          previousRows,
-          previousHealth,
-          enabled.has(provider)
-        )
+      const health = healthFromResult(
+        result,
+        previousRows,
+        previousHealth,
+        enabled.has(provider)
       );
-      limits.push(...rowsFromResult(result, previousRows));
+      collectors.push(health);
+      limits.push(...rowsFromResult(result, previousRows, health));
       continue;
     }
 
@@ -242,38 +251,80 @@ function healthFromResult(
   enabled: boolean
 ): CollectorHealth {
   const hasPreviousRows = previousRows.length > 0;
-  const state: CollectorState =
-    result.ok || !hasPreviousRows ? result.state : "stale";
   const previousRowIds = actionableRowIds(previousRows);
   const currentRowIds = actionableRowIds(result.limits);
+  const formatChanged =
+    result.ok &&
+    previous?.formatFingerprint !== undefined &&
+    result.formatFingerprint !== undefined &&
+    previous.formatFingerprint !== result.formatFingerprint;
+  const rowInventoryChanged =
+    result.ok && previousRowIds.length > 0
+      ? !sameStringArray(previousRowIds, currentRowIds)
+      : undefined;
+  // A parser/layout update is intentional when the shipped adapter version
+  // changed. Publish the new code's validated rows locally, while retaining the
+  // change flags so the protected canary still requires explicit acceptance.
+  const adapterUpdated =
+    result.ok &&
+    previous !== undefined &&
+    previous.adapterVersion !== result.adapterVersion;
+  const compatibilityDrift =
+    (formatChanged || rowInventoryChanged === true) && !adapterUpdated;
+  const attemptState = compatibilityDrift ? "drift" : result.state;
+  const accepted = result.ok && !compatibilityDrift;
+  const state: CollectorState =
+    accepted || !hasPreviousRows ? attemptState : "stale";
+  const attemptError = compatibilityDrift
+    ? compatibilityDriftMessage(formatChanged, rowInventoryChanged === true)
+    : result.error;
+  // A failed attempt has not established a new verified contract. Preserve
+  // the last accepted adapter/fingerprint so a repaired release with a bumped
+  // adapter can recover automatically on the next successful refresh. Storing
+  // a failed attempt's adapter here would consume that bump and deadlock the
+  // repaired result behind same-version drift quarantine.
+  const preserveVerifiedContract = state === "stale" && previous !== undefined;
   return {
     provider: result.provider,
     enabled,
-    ok: result.ok,
+    ok: accepted,
     state,
-    attemptState: result.state,
+    attemptState,
     checkedAt: result.checkedAt,
     durationMs: result.durationMs,
-    adapterVersion: result.adapterVersion,
-    formatFingerprint: result.formatFingerprint,
-    formatChanged:
-      previous?.formatFingerprint !== undefined &&
-      result.formatFingerprint !== undefined &&
-      previous.formatFingerprint !== result.formatFingerprint,
-    rowInventoryChanged:
-      result.ok && previousRowIds.length > 0
-        ? !sameStringArray(previousRowIds, currentRowIds)
-        : undefined,
+    adapterVersion: preserveVerifiedContract
+      ? previous.adapterVersion
+      : result.adapterVersion,
+    formatFingerprint: preserveVerifiedContract
+      ? previous.formatFingerprint
+      : result.formatFingerprint,
+    formatChanged,
+    rowInventoryChanged,
     error:
-      state === "stale" && result.error
-        ? `Last refresh ${result.state}: ${result.error}`
-        : result.error,
+      state === "stale" && attemptError
+        ? `Last refresh ${attemptState}: ${attemptError}`
+        : attemptError,
   };
+}
+
+function compatibilityDriftMessage(
+  formatChanged: boolean,
+  rowInventoryChanged: boolean
+): string {
+  if (formatChanged && rowInventoryChanged) {
+    return "Adapter contract rejected an unexpected provider format and quota-row inventory change.";
+  }
+  if (formatChanged) {
+    return "Adapter contract rejected an unexpected provider format change.";
+  }
+  return "Adapter contract rejected an unexpected quota-row inventory change.";
 }
 
 function actionableRowIds(rows: UsageLimit[]): string[] {
   return rows
-    .filter((row) => !row.informational)
+    .filter(
+      (row) => !row.informational && !isConditionallyReportedLimit(row)
+    )
     .map((row) => row.id)
     .sort();
 }
@@ -287,9 +338,10 @@ function sameStringArray(left: string[], right: string[]): boolean {
 
 function rowsFromResult(
   result: ProviderCollectorResult,
-  previousRows: UsageLimit[]
+  previousRows: UsageLimit[],
+  health: CollectorHealth
 ): UsageLimit[] {
-  if (result.ok) {
+  if (health.ok) {
     return result.limits.map((row) => ({
       ...row,
       freshness: "verified",
@@ -297,17 +349,14 @@ function rowsFromResult(
     }));
   }
   if (previousRows.length === 0) return [];
-  return previousRows.map((row) => markRowStale(row, result));
+  return previousRows.map((row) => markRowStale(row, health.error));
 }
 
-function markRowStale(
-  row: UsageLimit,
-  result: ProviderCollectorResult
-): UsageLimit {
+function markRowStale(row: UsageLimit, error?: string): UsageLimit {
   return {
     ...row,
     freshness: "stale",
     statusLabel: buildStaleStatusLabel(row.statusLabel),
-    error: result.error,
+    error,
   };
 }

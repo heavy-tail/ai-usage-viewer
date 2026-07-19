@@ -17,6 +17,7 @@ const fixtureDir = join(import.meta.dirname, "fixtures");
 const meta = {
   checkedAt: "2026-06-03T12:00:00.000Z",
   sourceCommand: "fixture",
+  sourceTimeZone: "Asia/Seoul",
   planLabel: "Fixture Plan",
   accountLabel: "person@example.com",
 };
@@ -48,20 +49,71 @@ describe("provider parsers", () => {
       "",
       "Current week (all models)",
       "20% used",
-      "Resets Jul 7, 4pm (Asia/Seoul)",
+      "Resets Jun 7, 4pm (Asia/Seoul)",
       "",
       "What's contributing to your limits usage?",
     ].join("\n");
     const limits = parseClaudeUsage(text, meta);
     expect(limits).toHaveLength(2);
     expect(pick(limits, "claude:session")).toMatchObject({ usedPercent: 3 });
-    expect(pick(limits, "claude:week-all")).toMatchObject({ usedPercent: 20 });
+    expect(pick(limits, "claude:week-all")).toMatchObject({
+      usedPercent: 20,
+      sourceText: expect.not.stringContaining("What's contributing"),
+    });
     expect(limits.find((l) => l.id === "claude:week-sonnet")).toBeUndefined();
   });
 
   it("uses configured Claude Max tier label when auth only reports max", () => {
     const auth = parseClaudeAuthStatus("loggedIn: true\nsubscriptionType: max\n");
     expect(claudePlanLabel(auth, "Max 200")).toBe("Max 200");
+  });
+
+  it("rejects an implausible required Claude reset and omits an invalid optional one", () => {
+    expect(() =>
+      parseClaudeUsage(
+        [
+          "Current session",
+          "3% used",
+          "Current week (all models)",
+          "20% used",
+          "Resets in 104000000d",
+        ].join("\n"),
+        meta
+      )
+    ).toThrow(ParserDriftError);
+
+    const limits = parseClaudeUsage(
+      [
+        "Current session",
+        "3% used",
+        "Resets after billing review",
+        "Current week (all models)",
+        "20% used",
+        "Resets Jun 7, 4pm (Asia/Seoul)",
+      ].join("\n"),
+      meta
+    );
+    expect(pick(limits, "claude:session").resetLabel).toBeUndefined();
+  });
+
+  it("parses the current JSON Claude auth status without skipping login", () => {
+    const auth = parseClaudeAuthStatus(
+      JSON.stringify({
+        loggedIn: true,
+        email: "person@example.com",
+        orgId: "org_fixture",
+        orgName: "Fixture Organization",
+        subscriptionType: "max",
+      })
+    );
+
+    expect(auth).toEqual({
+      loggedIn: true,
+      email: "person@example.com",
+      orgId: "org_fixture",
+      orgName: "Fixture Organization",
+      subscriptionType: "max",
+    });
   });
 
   it("parses Codex footer fixture", async () => {
@@ -296,6 +348,31 @@ describe("provider parsers", () => {
       status: "exhausted",
       resetLabel: "Resets Aug 1, 09:00 PT",
     });
+  });
+
+  it("accepts the current zone-less Grok reset and unknown-period fallback", () => {
+    const limits = parseGrokUsage(
+      "Usage limit: 50% · Next reset: Mar 31, 12:00",
+      meta
+    );
+
+    expect(pick(limits, "grok:usage")).toMatchObject({
+      usedPercent: 50,
+      remainingPercent: 50,
+      resetLabel: "Resets Mar 31, 12:00",
+    });
+  });
+
+  it("rejects partial warning footers and inconsistent duplicate values", () => {
+    expect(() =>
+      parseGrokUsage("Weekly limit left: 9%", meta)
+    ).toThrow(ParserDriftError);
+    expect(() =>
+      parseGrokUsage(
+        "Weekly limit: 20%\nWeekly limit: 21%\nWeekly limit left: 80%",
+        meta
+      )
+    ).toThrow(ParserDriftError);
   });
 
   it("throws drift when anchors are missing", async () => {

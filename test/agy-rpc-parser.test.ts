@@ -138,6 +138,16 @@ describe("Agy local quota RPC parser", () => {
     );
   });
 
+  it.each([
+    "9999-01-01T00:00:00Z",
+    "2026-07-01T00:00:00Z",
+    "2026-08-01T00:00:00Z",
+  ])("rejects resetTime outside the weekly horizon: %s", (resetTime) => {
+    expect(() => parseAgyRpcQuota(singleBucket({ resetTime }), meta)).toThrow(
+      ParserDriftError
+    );
+  });
+
   it("accepts an RFC3339 reset with an offset and canonicalizes it to UTC", () => {
     const result = parseAgyRpcQuota(
       singleBucket({ resetTime: "2026-07-18T14:30:00+09:00" }),

@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { access, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
@@ -14,6 +17,7 @@ import type { CollectorContext, CommandRunner } from "../src/collectors/types";
 import { parseCodexAppServerRateLimits } from "../src/parsers/codex";
 import { ParserDriftError } from "../src/parsers/errors";
 import packageMetadata from "../package.json";
+import { WINDOWS_JOB_HOST_PATH } from "../src/collectors/windowsJobHost";
 
 const checkedAt = "2026-07-18T00:00:00.000Z";
 const meta = {
@@ -43,15 +47,21 @@ describe("Codex app-server JSON-RPC client", () => {
     ) as unknown as CodexAppServerSpawn;
     const result = await readCodexAppServerRateLimits({
       cwd: "C:\\repo",
+      command: "C:\\Tools\\codex.exe",
       timeoutMs: 500,
       spawnProcess,
       platform: "win32",
-      windowsCommandShell: "C:\\Windows\\System32\\cmd.exe",
     });
 
     expect(spawnProcess).toHaveBeenCalledWith(
-      "C:\\Windows\\System32\\cmd.exe",
-      ["/d", "/s", "/c", "codex app-server"],
+      WINDOWS_JOB_HOST_PATH,
+      [
+        "--pipe",
+        String(process.pid),
+        "C:\\Tools\\codex.exe",
+        "C:\\repo",
+        "app-server",
+      ],
       expect.objectContaining({
         cwd: "C:\\repo",
         windowsHide: true,
@@ -89,6 +99,7 @@ describe("Codex app-server JSON-RPC client", () => {
     await expect(
       readCodexAppServerRateLimits({
         cwd: process.cwd(),
+        command: process.execPath,
         timeoutMs: 20,
         spawnProcess,
       })
@@ -110,6 +121,7 @@ describe("Codex app-server JSON-RPC client", () => {
     await expect(
       readCodexAppServerRateLimits({
         cwd: process.cwd(),
+        command: process.execPath,
         timeoutMs: 500,
         maxOutputBytes: 256,
         spawnProcess: (() =>
@@ -137,6 +149,7 @@ describe("Codex app-server JSON-RPC client", () => {
 
     const result = await readCodexAppServerRateLimits({
       cwd: process.cwd(),
+      command: process.execPath,
       spawnProcess: (() =>
         child as unknown as ChildProcessWithoutNullStreams) as CodexAppServerSpawn,
       terminateProcess: async (process) => {
@@ -149,6 +162,36 @@ describe("Codex app-server JSON-RPC client", () => {
     expect(result.payload).toEqual(payload);
     expect(cleanupFinished).toBe(true);
   });
+
+  it.skipIf(process.platform !== "win32")(
+    "contains the real app-server process tree from launch through success",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "usage-viewer-codex-app-"));
+      const marker = join(directory, "orphan-marker.txt");
+      const fixture = resolve("test", "fixtures", "codex-app-server.mjs");
+      const previousMarker = process.env.USAGE_VIEWER_TEST_CODEX_ORPHAN_MARKER;
+      process.env.USAGE_VIEWER_TEST_CODEX_ORPHAN_MARKER = marker;
+      try {
+        const result = await readCodexAppServerRateLimits({
+          cwd: process.cwd(),
+          command: process.execPath,
+          commandArgs: [fixture],
+          timeoutMs: 5_000,
+        });
+        expect(result.payload).toEqual({ fixture: true });
+      } finally {
+        if (previousMarker === undefined) {
+          delete process.env.USAGE_VIEWER_TEST_CODEX_ORPHAN_MARKER;
+        } else {
+          process.env.USAGE_VIEWER_TEST_CODEX_ORPHAN_MARKER = previousMarker;
+        }
+      }
+
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 1_300));
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+    12_000
+  );
 });
 
 describe("Codex structured rate-limit parser", () => {
@@ -322,6 +365,36 @@ describe("Codex structured rate-limit parser", () => {
     });
   });
 
+  it("does not downgrade a single-view workspace hard stop when multi-bucket data exists", () => {
+    const payload = rateLimitPayload();
+    const single = payload.rateLimits as Record<string, unknown>;
+    single.rateLimitReachedType = "workspace_member_usage_limit_reached";
+    const buckets = payload.rateLimitsByLimitId as Record<
+      string,
+      Record<string, unknown>
+    >;
+    buckets.codex.rateLimitReachedType = null;
+    buckets.codex_other.rateLimitReachedType = null;
+
+    const limits = parseCodexAppServerRateLimits(payload, meta);
+
+    expect(limits).not.toHaveLength(0);
+    expect(limits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "codex:5h",
+          status: "exhausted",
+          blockingReason: "Workspace usage limit reached",
+        }),
+        expect.objectContaining({
+          id: "codex:codex-other:1h",
+          status: "exhausted",
+          blockingReason: "Workspace usage limit reached",
+        }),
+      ])
+    );
+  });
+
   it("supports the forward-compatible spend-control hard stop", () => {
     const limits = parseCodexAppServerRateLimits(
       {
@@ -338,6 +411,53 @@ describe("Codex structured rate-limit parser", () => {
       status: "exhausted",
       blockingReason: "Workspace spending limit reached",
     });
+  });
+
+  it("applies the current per-bucket spend-control hard stop only to its bucket", () => {
+    const payload = rateLimitPayload();
+    const buckets = payload.rateLimitsByLimitId as Record<
+      string,
+      Record<string, unknown>
+    >;
+    buckets.codex.spendControlReached = false;
+    buckets.codex_other.spendControlReached = true;
+
+    const limits = parseCodexAppServerRateLimits(payload, meta);
+    expect(limits.find((limit) => limit.id === "codex:5h")).toMatchObject({
+      status: "available",
+    });
+    expect(
+      limits.find((limit) => limit.id === "codex:codex-other:1h")
+    ).toMatchObject({
+      status: "exhausted",
+      blockingReason: "Workspace spending limit reached",
+    });
+  });
+
+  it("rejects map-key mismatches and duplicate semantic windows", () => {
+    const mismatched = rateLimitPayload();
+    const mismatchedBuckets = mismatched.rateLimitsByLimitId as Record<
+      string,
+      Record<string, unknown>
+    >;
+    mismatchedBuckets.codex.limitId = "different";
+    expect(() => parseCodexAppServerRateLimits(mismatched, meta)).toThrow(
+      ParserDriftError
+    );
+
+    const duplicate = rateLimitPayload();
+    const duplicateBuckets = duplicate.rateLimitsByLimitId as Record<
+      string,
+      Record<string, unknown>
+    >;
+    duplicateBuckets.codex.secondary = {
+      usedPercent: 40,
+      windowDurationMins: 300,
+      resetsAt: 1_730_947_200,
+    };
+    expect(() => parseCodexAppServerRateLimits(duplicate, meta)).toThrow(
+      ParserDriftError
+    );
   });
 
   it("fails closed on unknown hard-stop values and non-usage fields", () => {
@@ -401,24 +521,17 @@ describe("Codex collector app-server preference", () => {
     expect(ptyRunner).not.toHaveBeenCalled();
   });
 
-  it("falls back to the existing terminal collector when app-server fails", async () => {
-    const footer =
-      "gpt-5.5 - Context 100% left - 5h 97% left - weekly 76% left";
-    const ptyRunner = vi.fn(async () => ({
-      rawOutput: footer,
-      cleanedOutput: footer,
-    })) as unknown as PtyRunner;
+  it("does not promote a terminal subset when app-server fails", async () => {
+    const ptyRunner = vi.fn() as unknown as PtyRunner;
     const result = await collectCodex(collectorContext(ptyRunner), {
       appServerReader: async () => {
         throw new CodexAppServerError("Method not found");
       },
     });
 
-    expect(result.state).toBe("ok");
-    expect(result.limits.find((limit) => limit.id === "codex:5h")).toMatchObject({
-      remainingPercent: 97,
-    });
-    expect(ptyRunner).toHaveBeenCalledOnce();
+    expect(result.state).toBe("unavailable");
+    expect(result.limits).toEqual([]);
+    expect(ptyRunner).not.toHaveBeenCalled();
   });
 
   it("fails closed when app-server returns an incomplete structured payload", async () => {
@@ -488,10 +601,10 @@ function collectorContext(ptyRunner: PtyRunner): CollectorContext {
 
 function commandRunner(): CommandRunner {
   return async (command) => {
-    if (command === "where.exe") {
+    if (command.toLowerCase().endsWith("\\where.exe")) {
       return { stdout: "codex.cmd\n", stderr: "", exitCode: 0 };
     }
-    if (command === "codex") {
+    if (/codex(?:\.exe|\.cmd)?$/i.test(command)) {
       return { stdout: "Logged in using ChatGPT\n", stderr: "", exitCode: 0 };
     }
     return { stdout: "", stderr: "", exitCode: 0 };
