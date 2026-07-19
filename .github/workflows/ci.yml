@@ -178,10 +178,9 @@ jobs:
             try {
               $env:PORT = "$port"
               $env:COMPATIBILITY_CHECK_INTERVAL_MINUTES = "1440"
-              $tsxCli = Join-Path $bundleRoot "node_modules/tsx/dist/cli.mjs"
               $server = Start-Process `
                 -FilePath "node.exe" `
-                -ArgumentList @($tsxCli, "src/server.ts") `
+                -ArgumentList @("--import", "tsx", "src/server.ts") `
                 -WorkingDirectory $bundleRoot `
                 -PassThru `
                 -RedirectStandardOutput $stdout `
