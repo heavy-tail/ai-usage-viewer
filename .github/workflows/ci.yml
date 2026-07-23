@@ -53,7 +53,7 @@ jobs:
             throw "package.json contains an invalid release version: $packageVersion"
           }
           $safeVersion = $packageVersion -replace '[^A-Za-z0-9._-]', '-'
-          $releaseDir = Join-Path $PWD ".release"
+          $releaseDir = Join-Path $PWD "release-artifacts"
           $bundleDir = Join-Path $releaseDir "usage-viewer"
           New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
 
@@ -145,7 +145,7 @@ jobs:
       - name: Smoke-test the staged deployment bundle
         shell: pwsh
         run: |
-          $archive = @(Get-ChildItem -LiteralPath ".release" -Filter "*.zip" -File)
+          $archive = @(Get-ChildItem -LiteralPath "release-artifacts" -Filter "*.zip" -File)
           if ($archive.Count -ne 1) {
             throw "Expected exactly one staged deployment archive; found $($archive.Count)."
           }
@@ -272,8 +272,8 @@ jobs:
         with:
           name: usage-viewer-windows-node-${{ github.run_number }}
           path: |
-            .release/*.zip
-            .release/*.sha256
+            release-artifacts/*.zip
+            release-artifacts/*.sha256
           if-no-files-found: error
           # Stable across partial reruns so downstream failed jobs can still
           # consume a bundle produced by an earlier attempt of this workflow.

@@ -55,6 +55,13 @@ describe("privileged compatibility workflows", () => {
     expect(reader).not.toContain("[IO.File]::Replace");
     expect(candidate).toContain("compatibility:baseline:create");
     expect(candidate).toContain("candidateSha256");
+    expect(canary).toContain(
+      "path: canary-artifacts/compatibility-report.json"
+    );
+    expect(canary).toContain(
+      "canary-artifacts/candidate-baseline.json"
+    );
+    expect(canary).not.toContain(".canary-artifacts");
 
     expect(writer).toContain(
       "runs-on: [self-hosted, Windows, X64, usage-viewer-canary-writer]"
@@ -90,6 +97,14 @@ describe("privileged compatibility workflows", () => {
     const ci = await workflow("ci.yml");
     const release = await workflow("release.yml");
 
+    expect(ci).toContain('$releaseDir = Join-Path $PWD "release-artifacts"');
+    expect(ci).toContain(
+      'Get-ChildItem -LiteralPath "release-artifacts" -Filter "*.zip"'
+    );
+    expect(ci).toContain("release-artifacts/*.zip");
+    expect(ci).toContain("release-artifacts/*.sha256");
+    expect(ci).not.toContain('Join-Path $PWD ".release"');
+    expect(ci).not.toContain(".release/*.zip");
     expect(ci).toContain("BUILD-PROVENANCE.json");
     expect(ci).toContain("sourceCommit = $env:GITHUB_SHA.ToLowerInvariant()");
     expect(ci).toContain("packageVersion = $packageVersion");
