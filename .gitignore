@@ -2,6 +2,8 @@ node_modules
 dist
 .runtime
 data
+release-artifacts
+canary-artifacts
 *.tsbuildinfo
 *.local
 .DS_Store

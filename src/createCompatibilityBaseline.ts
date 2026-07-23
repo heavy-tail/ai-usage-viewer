@@ -25,7 +25,7 @@ if (issues.length > 0) {
   throw new Error(`Compatibility baseline rejected: ${issues.join("; ")}`);
 }
 
-const artifactDir = join(rootDir, ".canary-artifacts");
+const artifactDir = join(rootDir, "canary-artifacts");
 await mkdir(artifactDir, { recursive: true });
 await writeFile(
   join(artifactDir, "candidate-baseline.json"),

@@ -88,7 +88,7 @@ jobs:
         run: |
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
           $targets = @(
-            (Join-Path $workspace ".canary-artifacts"),
+            (Join-Path $workspace "canary-artifacts"),
             (Join-Path $workspace "config.json"),
             (Join-Path $workspace "data/raw"),
             (Join-Path $workspace "data/usage-snapshot.json"),
@@ -261,7 +261,7 @@ jobs:
           & $npm --ignore-scripts run compatibility:baseline:create
           if ($LASTEXITCODE -ne 0) { throw "Candidate baseline creation failed." }
 
-          $candidate = Join-Path $PWD ".canary-artifacts/candidate-baseline.json"
+          $candidate = Join-Path $PWD "canary-artifacts/candidate-baseline.json"
           $manifest = [ordered]@{
             schemaVersion = 1
             repository = $repository
@@ -271,7 +271,7 @@ jobs:
             candidateSha256 = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
           }
           $manifest | ConvertTo-Json |
-            Set-Content -LiteralPath (Join-Path $PWD ".canary-artifacts/candidate-manifest.json") -Encoding utf8
+            Set-Content -LiteralPath (Join-Path $PWD "canary-artifacts/candidate-manifest.json") -Encoding utf8
           $artifact = "compatibility-baseline-candidate-$runId-$runAttempt"
           "artifact_name=$artifact" >> $outputFile
 
@@ -287,7 +287,7 @@ jobs:
           CANDIDATE_OUTCOME: ${{ steps.candidate.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          $outputDir = Join-Path $PWD ".canary-artifacts"
+          $outputDir = Join-Path $PWD "canary-artifacts"
           New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
           $source = $null
           $sourcePath = Join-Path $PWD "data/compatibility-report.json"
@@ -347,7 +347,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: redacted-compatibility-report-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .canary-artifacts/compatibility-report.json
+          path: canary-artifacts/compatibility-report.json
           if-no-files-found: error
           retention-days: 14
 
@@ -361,8 +361,8 @@ jobs:
         with:
           name: ${{ steps.candidate.outputs.artifact_name }}
           path: |
-            .canary-artifacts/candidate-baseline.json
-            .canary-artifacts/candidate-manifest.json
+            canary-artifacts/candidate-baseline.json
+            canary-artifacts/candidate-manifest.json
           if-no-files-found: error
           retention-days: 1
 
@@ -372,7 +372,7 @@ jobs:
         run: |
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
           $targets = @(
-            (Join-Path $workspace ".canary-artifacts"),
+            (Join-Path $workspace "canary-artifacts"),
             (Join-Path $workspace "config.json"),
             (Join-Path $workspace "data/raw"),
             (Join-Path $workspace "data/usage-snapshot.json"),
