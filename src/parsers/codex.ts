@@ -177,6 +177,12 @@ export function parseCodexAppServerRateLimits(
     const limitName = bucket.limitName;
     const defaultBucket = limitId.toLowerCase() === "codex";
     const groupLabel = bucketLabel(limitId, limitName);
+    const spendControlReached = effectiveSpendControlReached(
+      bucket,
+      singleBucket,
+      legacySpendControlReached,
+      drift
+    );
     const bucketMeta = {
       ...meta,
       planLabel:
@@ -202,8 +208,7 @@ export function parseCodexAppServerRateLimits(
           role,
           ...window,
           rateLimitReachedType: bucket.rateLimitReachedType ?? null,
-          spendControlReached:
-            bucket.spendControlReached ?? legacySpendControlReached ?? null,
+          spendControlReached: spendControlReached ?? null,
         },
         null,
         2
@@ -218,16 +223,16 @@ export function parseCodexAppServerRateLimits(
             scope: defaultBucket
               ? `${descriptor.label} limit`
               : `${groupLabel} ${descriptor.label} limit`,
-          window: descriptor.window,
-          usedPercent: window.usedPercent,
-          resetLabel: resetLabel(window.resetsAt),
-          resetAt: resetAt(window.resetsAt),
+            window: descriptor.window,
+            usedPercent: window.usedPercent,
+            resetLabel: resetLabel(window.resetsAt),
+            resetAt: resetAt(window.resetsAt),
             statusLabel: defaultBucket ? undefined : groupLabel,
             sourceText,
             meta: bucketMeta,
           }),
           bucket,
-          legacySpendControlReached,
+          spendControlReached,
           singleBucket
         )
       );
@@ -245,8 +250,7 @@ export function parseCodexAppServerRateLimits(
           limitName: limitName ?? null,
           individualLimit: individual,
           rateLimitReachedType: bucket.rateLimitReachedType ?? null,
-          spendControlReached:
-            bucket.spendControlReached ?? legacySpendControlReached ?? null,
+          spendControlReached: spendControlReached ?? null,
         },
         null,
         2
@@ -261,15 +265,15 @@ export function parseCodexAppServerRateLimits(
               ? "Individual usage limit"
               : `${groupLabel} individual usage limit`,
             window: "spend-control",
-          remainingPercent: individual.remainingPercent,
-          resetLabel: resetLabel(individual.resetsAt),
-          resetAt: resetAt(individual.resetsAt),
+            remainingPercent: individual.remainingPercent,
+            resetLabel: resetLabel(individual.resetsAt),
+            resetAt: resetAt(individual.resetsAt),
             statusLabel: `${individual.used} of ${individual.limit}`,
             sourceText,
             meta: bucketMeta,
           }),
           bucket,
-          legacySpendControlReached,
+          spendControlReached,
           singleBucket
         )
       );
@@ -766,16 +770,33 @@ function resetAt(value?: number): string | undefined {
 function applyHardStop(
   limit: UsageLimit,
   bucket: StructuredBucket,
-  legacySpendControlReached: boolean | undefined,
+  spendControlReached: boolean | undefined,
   singleBucket?: StructuredBucket
 ): UsageLimit {
   const blockingReason = hardStopReason(
     effectiveHardStop(bucket, singleBucket),
-    bucket.spendControlReached ?? legacySpendControlReached
+    spendControlReached
   );
   return blockingReason
     ? { ...limit, status: "exhausted", blockingReason }
     : limit;
+}
+
+function effectiveSpendControlReached(
+  bucket: StructuredBucket,
+  singleBucket: StructuredBucket | undefined,
+  legacySpendControlReached: boolean | undefined,
+  drift: (message: string) => never
+): boolean | undefined {
+  const candidates = [
+    bucket.spendControlReached,
+    singleBucket === bucket ? undefined : singleBucket?.spendControlReached,
+    legacySpendControlReached,
+  ].filter((value): value is boolean => value !== undefined);
+  if (new Set(candidates).size > 1) {
+    drift("Codex app-server returned conflicting workspace spend controls.");
+  }
+  return candidates[0];
 }
 
 function effectiveHardStop(

@@ -26,24 +26,52 @@ describe("privileged compatibility workflows", () => {
     expect(request).not.toMatch(/runs-on:.*self-hosted/);
   });
 
-  it("writes the protected baseline only after a manual approval run", async () => {
+  it("separates provider collection from approved baseline promotion", async () => {
     const canary = await workflow("compatibility-canary.yml");
-    const persist = between(
+    const reader = between(
       canary,
-      "- name: Persist successful protected baseline",
-      "- name: Create redacted compatibility artifact"
+      "  compatibility:",
+      "  promote-baseline:"
     );
-    const sanitize = between(
+    const writer = canary.slice(canary.indexOf("  promote-baseline:"));
+    const candidate = between(
       canary,
-      "- name: Create redacted compatibility artifact",
-      "- name: Upload redacted compatibility report only"
+      "- name: Create a privacy-safe baseline candidate",
+      "- name: Create the allow-list redacted compatibility report"
     );
 
-    expect(persist).toContain("github.event_name == 'workflow_run'");
-    expect(sanitize).toContain('$env:BASELINE_OUTCOME -eq "skipped"');
-    expect(sanitize).toContain('$env:BASELINE_OUTCOME -eq "success"');
-    expect(canary).toContain("npm run compatibility:baseline:validate");
-    expect(sanitize).toContain("$baselineValidationPassed");
+    expect(reader).toContain(
+      "runs-on: [self-hosted, Windows, X64, usage-viewer-canary]"
+    );
+    expect(reader).toContain("environment: compatibility-canary-readonly");
+    expect(reader).toContain(
+      "Prove the provider runner cannot write the protected baseline"
+    );
+    expect(reader).toContain("npm ci --ignore-scripts");
+    expect(reader).toContain(
+      "'^(?i)(ACTIONS_|GITHUB_|RUNNER_|USAGE_VIEWER_CANARY_)'"
+    );
+    expect(reader).not.toContain("issues: write");
+    expect(reader).not.toContain("[IO.File]::Replace");
+    expect(candidate).toContain("compatibility:baseline:create");
+    expect(candidate).toContain("candidateSha256");
+
+    expect(writer).toContain(
+      "runs-on: [self-hosted, Windows, X64, usage-viewer-canary-writer]"
+    );
+    expect(writer).toContain("environment: compatibility-canary");
+    expect(writer).not.toContain("actions/checkout@");
+    expect(writer).not.toContain("npm ");
+    expect(writer).toContain(
+      "Baseline promotion must use a different runner and Windows account."
+    );
+    expect(writer).toContain(
+      "The default branch advanced after the candidate was tested."
+    );
+    expect(writer.match(/Assert-MainUnchanged/g)).toHaveLength(3);
+    expect(writer).toContain("[IO.File]::Replace");
+    expect(canary).not.toContain("Open, update, or close the compatibility issue");
+    expect(canary).not.toContain("issues: write");
   });
 
   it("monitors the provider runner from an independent GitHub-hosted workflow", async () => {

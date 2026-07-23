@@ -92,16 +92,20 @@ async function route(
       json(res, 500, { error: "Stored snapshot has an invalid shape." });
       return;
     }
+    const refreshing =
+      refresh.isRunning() || (await isRefreshLockHeld(rootDir));
     json(res, 200, {
       snapshot,
-      refreshing: refresh.isRunning() || (await isRefreshLockHeld(rootDir)),
+      refreshing,
+      error: refreshing ? undefined : refresh.lastError?.(),
     });
     return;
   }
 
   if (method === "POST" && url.pathname === "/api/refresh") {
-    const snapshot = await refresh.refresh({ rootDir });
-    json(res, 200, { snapshot, refreshing: false });
+    beginBackgroundRefresh(refresh, { rootDir });
+    const snapshot = (await readSnapshot(rootDir)) ?? emptyUsageSnapshot();
+    json(res, 202, { snapshot, refreshing: true });
     return;
   }
 
@@ -112,8 +116,9 @@ async function route(
       json(res, 404, { error: "Unknown provider." });
       return;
     }
-    const snapshot = await refresh.refresh({ rootDir, provider });
-    json(res, 200, { snapshot, refreshing: false });
+    beginBackgroundRefresh(refresh, { rootDir, provider });
+    const snapshot = (await readSnapshot(rootDir)) ?? emptyUsageSnapshot();
+    json(res, 202, { snapshot, refreshing: true });
     return;
   }
 
@@ -127,6 +132,22 @@ async function route(
   }
 
   json(res, 404, { error: "Not found." });
+}
+
+function beginBackgroundRefresh(
+  refresh: RefreshService,
+  options: { rootDir: string; provider?: UsageProvider }
+): void {
+  if (refresh.isRunning()) throw new RefreshInProgressError();
+  void refresh.refresh(options).catch((error) => {
+    // A cross-process lock race means another legitimate refresh won. Clients
+    // follow that operation through /api/snapshot just like an HTTP 409.
+    if (error instanceof RefreshInProgressError) return;
+    console.error(
+      "Background usage refresh failed:",
+      error instanceof Error ? error.message : "Unknown refresh error."
+    );
+  });
 }
 
 function isApiPath(pathname: string): boolean {

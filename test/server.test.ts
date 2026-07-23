@@ -158,6 +158,28 @@ describe("usage server routes", () => {
     });
   });
 
+  it("GET /api/snapshot exposes the completed background refresh error", async () => {
+    const rootDir = await workspace();
+    const failedRefresh: RefreshService = {
+      refresh: async () => {
+        throw new Error("provider collection failed");
+      },
+      isRunning: () => false,
+      lastError: () => "provider collection failed",
+    };
+    await withServer({ rootDir, refresh: failedRefresh }, async (base) => {
+      const res = await fetch(`${base}/api/snapshot`);
+      const body = (await res.json()) as {
+        refreshing: boolean;
+        error?: string;
+      };
+      expect(body).toMatchObject({
+        refreshing: false,
+        error: "provider collection failed",
+      });
+    });
+  });
+
   it("GET /api/snapshot surfaces storage corruption instead of an empty state", async () => {
     const rootDir = await workspace();
     await writeFile(
@@ -200,17 +222,40 @@ describe("usage server routes", () => {
     });
   });
 
-  it("POST /api/refresh returns the new snapshot", async () => {
+  it("POST /api/refresh starts the server-owned refresh without waiting for it", async () => {
     const rootDir = await workspace();
-    await withServer({ rootDir, refresh: okRefresh }, async (base) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let running = false;
+    let calls = 0;
+    const backgroundRefresh: RefreshService = {
+      refresh: async () => {
+        calls += 1;
+        running = true;
+        await pending;
+        running = false;
+        return validSnapshot;
+      },
+      isRunning: () => running,
+    };
+
+    await withServer({ rootDir, refresh: backgroundRefresh }, async (base) => {
       const res = await fetch(`${base}/api/refresh`, { method: "POST" });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
       const body = (await res.json()) as {
         snapshot: UsageSnapshot;
         refreshing: boolean;
       };
-      expect(body.refreshing).toBe(false);
-      expect(body.snapshot.generatedAt).toBe(validSnapshot.generatedAt);
+      expect(body.refreshing).toBe(true);
+      expect(calls).toBe(1);
+
+      const during = await fetch(`${base}/api/snapshot`);
+      expect(await during.json()).toMatchObject({ refreshing: true });
+      release();
+      await pending;
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
   });
 

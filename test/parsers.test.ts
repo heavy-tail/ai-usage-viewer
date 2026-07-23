@@ -352,7 +352,7 @@ describe("provider parsers", () => {
 
   it("accepts the current zone-less Grok reset and unknown-period fallback", () => {
     const limits = parseGrokUsage(
-      "Usage limit: 50% · Next reset: Mar 31, 12:00",
+      "Usage: 50% · Next reset: Mar 31, 12:00",
       meta
     );
 
@@ -361,6 +361,54 @@ describe("provider parsers", () => {
       remainingPercent: 50,
       resetLabel: "Resets Mar 31, 12:00",
     });
+  });
+
+  it("keeps paid Grok continuation capacity visible after included usage", () => {
+    const limits = parseGrokUsage(
+      [
+        "Usage: 100%",
+        "Credits: $5.00",
+        "Auto topup: disabled",
+        "Pay-as-you-go: $2.00 used of $10.00 limit",
+      ].join("\n"),
+      meta
+    );
+
+    expect(pick(limits, "grok:usage")).toMatchObject({
+      usedPercent: 100,
+      remainingPercent: 0,
+      status: "warning",
+      statusLabel: "Included usage exhausted; paid usage remains available",
+    });
+    expect(pick(limits, "grok:credits")).toMatchObject({
+      status: "available",
+      informational: true,
+      statusLabel: "$5.00 available",
+    });
+    expect(pick(limits, "grok:pay-as-you-go")).toMatchObject({
+      usedPercent: 20,
+      remainingPercent: 80,
+      status: "available",
+    });
+    expect(pick(limits, "grok:auto-topup")).toMatchObject({
+      informational: true,
+      statusLabel: "Disabled",
+    });
+  });
+
+  it("fails closed on malformed or contradictory Grok billing fields", () => {
+    expect(() =>
+      parseGrokUsage("Usage: 50%\nAuto topup: maybe", meta)
+    ).toThrow(ParserDriftError);
+    expect(() =>
+      parseGrokUsage("Usage: 50%\nCredits: $1\nCredits: $2", meta)
+    ).toThrow(ParserDriftError);
+    expect(() =>
+      parseGrokUsage(
+        "Usage: 50%\nPay-as-you-go: $11 used of $10 limit",
+        meta
+      )
+    ).toThrow(ParserDriftError);
   });
 
   it("rejects partial warning footers and inconsistent duplicate values", () => {

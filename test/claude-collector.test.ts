@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { collectClaude } from "../src/collectors/claude";
 import { DEFAULT_CONFIG } from "../src/config";
 import type { PtyRunner, RunPtyOptions } from "../src/collectors/pty";
@@ -14,6 +14,15 @@ const usageOutput = [
 ].join("\n");
 
 describe("Claude collector compatibility", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-19T00:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("uses flat screen-reader output when the installed CLI supports it", async () => {
     const ptyRunner = successfulPty();
     const result = await collectClaude(context(ptyRunner, true));

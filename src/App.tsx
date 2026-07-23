@@ -26,23 +26,27 @@ export function App() {
   const [refreshing, setRefreshing] = useState<"all" | UsageProvider | null>(null);
   const [queuedProviders, setQueuedProviders] = useState<UsageProvider[]>([]);
 
-  // Poll the snapshot until an in-progress refresh finishes (collectors can
-  // take 20-30s). Used both on mount and when a refresh returns 409.
+  // Refresh initiation is asynchronous. Follow the server-owned operation
+  // until its cross-process lock clears, including legitimate cold starts that
+  // exceed an individual HTTP request budget.
   const pollUntilIdle = useCallback(async (signal?: AbortSignal) => {
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < 150; i += 1) {
       await sleep(2_000);
       if (signal?.aborted) return;
+      let poll;
       try {
-        const poll = await getSnapshot(signal);
-        if (signal?.aborted) return;
-        setSnapshot(poll.snapshot);
-        setConnection("live");
-        if (!poll.refreshing) {
-          return;
-        }
+        poll = await getSnapshot(signal);
       } catch {
         // A transient failure while the refresh lock is held is expected;
         // keep polling until it clears or we hit the attempt cap.
+        continue;
+      }
+      if (signal?.aborted) return;
+      setSnapshot(poll.snapshot);
+      setConnection("live");
+      if (!poll.refreshing) {
+        if (poll.error) throw new Error(poll.error);
+        return;
       }
     }
     throw new Error("Refresh verification timed out.");
@@ -56,6 +60,7 @@ export function App() {
       const result = await apiRefreshAll();
       setSnapshot(result.snapshot);
       setConnection("live");
+      if (result.refreshing) await pollUntilIdle();
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
         // Another browser, the background monitor, or a command-line canary is
@@ -115,6 +120,7 @@ export function App() {
         const result = await apiRefreshProvider(provider);
         setSnapshot(result.snapshot);
         setConnection("live");
+        if (result.refreshing) await pollUntilIdle();
       } catch (err) {
         if (err instanceof ApiError && err.status === 409) {
           try {

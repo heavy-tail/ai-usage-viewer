@@ -121,6 +121,12 @@ export function trustedChildEnvironment(
     "npm_config_node_options",
     "npm_config_script_shell",
   ]);
+  const unsafePrefixes = [
+    "actions_",
+    "github_",
+    "runner_",
+    "usage_viewer_canary_",
+  ];
   const systemRoot = entries.get("systemroot")?.value;
   const path = entries.get("path")?.value;
   const result: NodeJS.ProcessEnv = {};
@@ -129,6 +135,7 @@ export function trustedChildEnvironment(
     if (
       entry.value === undefined ||
       unsafe.has(normalized) ||
+      unsafePrefixes.some((prefix) => normalized.startsWith(prefix)) ||
       normalized === "path" ||
       normalized === "pathext" ||
       normalized === "comspec"

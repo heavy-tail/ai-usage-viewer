@@ -9,6 +9,7 @@ const REFRESH_TIMEOUT_MS = 90_000;
 export type SnapshotResponse = {
   snapshot: UsageSnapshot;
   refreshing: boolean;
+  error?: string;
 };
 
 export class ApiError extends Error {
@@ -63,7 +64,11 @@ async function request(
     throw new ApiError(message, res.status, Boolean(body.refreshing));
   }
 
-  return { snapshot: body.snapshot, refreshing: Boolean(body.refreshing) };
+  return {
+    snapshot: body.snapshot,
+    refreshing: Boolean(body.refreshing),
+    error: typeof body.error === "string" ? body.error : undefined,
+  };
 }
 
 export function getSnapshot(signal?: AbortSignal): Promise<SnapshotResponse> {

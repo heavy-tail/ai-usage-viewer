@@ -169,6 +169,33 @@ describe("provider parser completeness", () => {
     expect(rows[0]).toMatchObject({ id: "grok:weekly", usedPercent: 100 });
   });
 
+  it("parses current Grok billing labels even when ConPTY glues cells", () => {
+    const rows = parseGrokUsage(
+      "Usage: 100%Credits: $0Auto topup: disabledPay-as-you-go: $0 used of $10 limit",
+      meta
+    );
+
+    expect(rows.find((row) => row.id === "grok:usage")).toMatchObject({
+      status: "warning",
+    });
+    expect(rows.find((row) => row.id === "grok:pay-as-you-go")).toMatchObject({
+      usedPercent: 0,
+      remainingPercent: 100,
+    });
+  });
+
+  it("does not mistake Grok erased-cell markers for a timezone", () => {
+    const rows = parseGrokUsage(
+      "Usage: 50% Next reset: July 25, 15:12XXX",
+      meta
+    );
+
+    expect(rows[0]).toMatchObject({
+      id: "grok:usage",
+      resetLabel: "Resets July 25, 15:12",
+    });
+  });
+
   it("tolerates Grok's erased-cell marker before a known footer", () => {
     const rows = parseGrokUsage(
       "X Weekly limit left: 0%\nWeekly limit: 100%",

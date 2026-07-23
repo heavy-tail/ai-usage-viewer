@@ -1,7 +1,12 @@
 import { validateLimits } from "./compatibility";
 import { buildCompatibilityReport } from "./compatibilityReport";
 import { validateSnapshotShape } from "./snapshot";
-import type { AppConfig, UsageProvider } from "./types";
+import type {
+  AppConfig,
+  UsageLimit,
+  UsageProvider,
+  UsageSnapshot,
+} from "./types";
 
 export function compatibilityBaselineIssues(
   value: unknown,
@@ -52,4 +57,68 @@ export function compatibilityBaselineIssues(
     issues.push("snapshot contains rows for a disabled provider");
   }
   return [...new Set(issues)];
+}
+
+/**
+ * The protected canary needs only the last accepted structural contract:
+ * collector fingerprints and semantic row IDs. Never promote account labels,
+ * quota values, reset times, or provider-rendered text into the trust anchor.
+ */
+export function redactedCompatibilityBaseline(
+  snapshot: UsageSnapshot
+): UsageSnapshot {
+  return {
+    generatedAt: snapshot.generatedAt,
+    timezone: snapshot.timezone,
+    collectors: snapshot.collectors.map((collector) => ({
+      provider: collector.provider,
+      enabled: collector.enabled,
+      ok: true,
+      state: "ok",
+      attemptState: "ok",
+      checkedAt: snapshot.generatedAt,
+      durationMs: 0,
+      adapterVersion: collector.adapterVersion,
+      formatFingerprint: collector.formatFingerprint,
+      formatChanged: false,
+      rowInventoryChanged: false,
+    })),
+    limits: snapshot.limits.map((row) =>
+      redactedBaselineRow(row, snapshot.generatedAt)
+    ),
+  };
+}
+
+function redactedBaselineRow(
+  row: UsageLimit,
+  generatedAt: string
+): UsageLimit {
+  return {
+    id: row.id,
+    provider: row.provider,
+    providerLabel: baselineProviderLabel(row.provider),
+    scope: row.id,
+    window: row.window ?? "structural",
+    usedPercent: 0,
+    remainingPercent: 100,
+    status: "available",
+    freshness: "verified",
+    informational: row.informational === true,
+    sourceCommand: "protected compatibility baseline",
+    sourceText: `${row.id} structural contract`,
+    checkedAt: generatedAt,
+  };
+}
+
+function baselineProviderLabel(provider: UsageProvider): string {
+  switch (provider) {
+    case "claude":
+      return "Claude Code";
+    case "codex":
+      return "Codex";
+    case "agy":
+      return "Antigravity";
+    case "grok":
+      return "Grok";
+  }
 }

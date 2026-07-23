@@ -6,11 +6,53 @@ import type { ProviderCollectorResult } from "./collectors/types";
 // relevant value whenever a provider contract changes so snapshots and canary
 // reports identify exactly which compatibility code produced them.
 export const ADAPTER_VERSIONS: Record<UsageProvider, string> = {
-  claude: "2.6.0",
-  codex: "2.3.0",
-  agy: "2.3.0",
-  grok: "2.3.0",
+  claude: "2.7.0",
+  codex: "2.4.0",
+  agy: "2.4.0",
+  grok: "2.4.0",
 };
+
+export type RowInventoryMigration = {
+  provider: UsageProvider;
+  fromAdapterVersion: string;
+  toAdapterVersion: string;
+  addedRowIds: readonly string[];
+  removedRowIds: readonly string[];
+};
+
+export type RowInventoryMigrationInput = {
+  provider: UsageProvider;
+  fromAdapterVersion?: string;
+  toAdapterVersion?: string;
+  previousRowIds: readonly string[];
+  currentRowIds: readonly string[];
+};
+
+/**
+ * Inventory changes require an explicit, reviewable declaration. Keep this
+ * list empty unless a provider adapter intentionally adds or removes semantic
+ * rows; a version bump alone is not authority to publish an incomplete subset.
+ */
+export const APPROVED_ROW_INVENTORY_MIGRATIONS: readonly RowInventoryMigration[] =
+  Object.freeze([
+    // Grok 0.2.111 replaced the period-specific quota row with "Usage" and
+    // may also expose a positive pay-as-you-go cap. These are the only two
+    // actionable inventory transitions authorized by the adapter upgrade.
+    {
+      provider: "grok",
+      fromAdapterVersion: "2.3.0",
+      toAdapterVersion: "2.4.0",
+      addedRowIds: ["grok:usage"],
+      removedRowIds: ["grok:weekly"],
+    },
+    {
+      provider: "grok",
+      fromAdapterVersion: "2.3.0",
+      toAdapterVersion: "2.4.0",
+      addedRowIds: ["grok:pay-as-you-go", "grok:usage"],
+      removedRowIds: ["grok:weekly"],
+    },
+  ]);
 
 /**
  * Enforce the normalized provider contract before a successful collector result
@@ -57,7 +99,10 @@ function formatEvidence(result: ProviderCollectorResult): string {
     // still validated when present, but it is not a stable layout contract.
     .filter((limit) => !isConditionallyReportedLimit(limit))
     .sort((left, right) => left.id.localeCompare(right.id))
-    .map((limit) => `${limit.id}\n${limit.sourceText.trim()}`)
+    // Normalize each source independently. Prefixing the row ID before parsing
+    // used to prevent JSON-backed evidence from entering the structural JSON
+    // normalizer, so runtime hard stops were accidentally hashed as "format".
+    .map((limit) => `${limit.id}\n${normalizeFormat(limit.sourceText)}`)
     .join("\n\n");
 }
 
@@ -138,6 +183,27 @@ export function fingerprintFormat(text: string): string | undefined {
   return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
 }
 
+export function isApprovedRowInventoryMigration(
+  input: RowInventoryMigrationInput,
+  migrations: readonly RowInventoryMigration[] =
+    APPROVED_ROW_INVENTORY_MIGRATIONS
+): boolean {
+  if (!input.fromAdapterVersion || !input.toAdapterVersion) return false;
+  const previous = [...new Set(input.previousRowIds)].sort();
+  const current = [...new Set(input.currentRowIds)].sort();
+  const added = current.filter((id) => !previous.includes(id));
+  const removed = previous.filter((id) => !current.includes(id));
+
+  return migrations.some(
+    (migration) =>
+      migration.provider === input.provider &&
+      migration.fromAdapterVersion === input.fromAdapterVersion &&
+      migration.toAdapterVersion === input.toAdapterVersion &&
+      sameStrings(added, migration.addedRowIds) &&
+      sameStrings(removed, migration.removedRowIds)
+  );
+}
+
 function validatePercent(
   limit: UsageLimit,
   field: "usedPercent" | "remainingPercent",
@@ -171,6 +237,14 @@ function normalizeFormat(text: string): string {
     .replace(/\b[0-9a-f]{16,}\b/gi, "<id>")
     .replace(/\b(?:org|account|session|user|team)[_-][a-z0-9_-]+\b/gi, "<id>")
     .replace(/[a-z]:\\[^\r\n]+/gi, "<path>")
+    .replace(
+      /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},\s*\d{1,2}:\d{2}(?:\s*[a-z]{2,4})?\b/gi,
+      "<reset>"
+    )
+    .replace(
+      /\b\d{1,2}:\d{2}\s*(?:am|pm)?\s+on\s+\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/gi,
+      "<reset>"
+    )
     .replace(/\b\d+(?:\.\d+)?%/g, "<percent>")
     .replace(/\b\d+(?:\.\d+)?\b/g, "<number>")
     .replace(/\s+/g, " ")
@@ -187,18 +261,41 @@ function structuredJsonFormat(text: string): string | undefined {
   }
 }
 
-function jsonShape(value: unknown): unknown {
+const DYNAMIC_STRUCTURED_FIELDS = new Set([
+  "limitName",
+  "rateLimitReachedType",
+  "spendControlReached",
+]);
+
+function jsonShape(value: unknown, field?: string): unknown {
+  if (field && DYNAMIC_STRUCTURED_FIELDS.has(field)) return "<dynamic>";
   if (value === null) return "null";
   if (Array.isArray(value)) {
-    const shapes = value.map(jsonShape).map((shape) => JSON.stringify(shape));
+    const shapes = value
+      .map((nested) => jsonShape(nested))
+      .map((shape) => JSON.stringify(shape));
     return { arrayOf: [...new Set(shapes)].sort().map((shape) => JSON.parse(shape)) };
   }
   if (typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-        .map(([key, nested]) => [key.normalize("NFKC"), jsonShape(nested)])
+        .map(([key, nested]) => [
+          key.normalize("NFKC"),
+          jsonShape(nested, key),
+        ])
     );
   }
   return `<${typeof value}>`;
+}
+
+function sameStrings(
+  left: readonly string[],
+  right: readonly string[]
+): boolean {
+  const normalizedRight = [...new Set(right)].sort();
+  return (
+    left.length === normalizedRight.length &&
+    left.every((value, index) => value === normalizedRight[index])
+  );
 }

@@ -3,15 +3,14 @@ name: Provider Compatibility Canary
 on:
   schedule:
     - cron: "17 */6 * * *"
-  # Manual acceptance is requested through a separate, unprivileged workflow.
-  # workflow_run always loads this privileged workflow from the default branch,
-  # so a manually selected feature ref can never rewrite the runner logic.
+  # The unprivileged request workflow supplies the approval trigger. GitHub
+  # loads this workflow from the default branch, never from a caller-selected
+  # feature ref.
   workflow_run:
     workflows: ["Request compatibility baseline acceptance"]
     types: [completed]
     branches: [main]
 
-# Never run two PTY canaries against the same provider test profile at once.
 concurrency:
   group: provider-compatibility-canary
   cancel-in-progress: false
@@ -28,22 +27,23 @@ jobs:
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'workflow_dispatch' &&
        github.event.workflow_run.head_branch == github.event.repository.default_branch)
-    # SECURITY: this custom label belongs only on a dedicated Windows runner
-    # whose service-account profile is authenticated to NON-PERSONAL provider
-    # test accounts. Never attach it to a developer workstation or personal
-    # profile, and never store provider credentials in this repository.
+    # This service account owns only non-personal provider test sessions. Its
+    # Windows ACL may read the canonical baseline but must not create, replace,
+    # or delete files in the baseline directory.
     runs-on: [self-hosted, Windows, X64, usage-viewer-canary]
-    # Configure required reviewers only on `compatibility-canary`. Scheduled
-    # read-only comparisons use the unprotected environment so they never wait
-    # for a human every six hours.
-    environment: ${{ github.event_name == 'workflow_run' && 'compatibility-canary' || 'compatibility-canary-readonly' }}
+    environment: compatibility-canary-readonly
     timeout-minutes: 20
     permissions:
       contents: read
-      issues: write
+    outputs:
+      canary_passed: ${{ steps.sanitize.outputs.passed }}
+      candidate_artifact: ${{ steps.candidate.outputs.artifact_name }}
+      tested_commit: ${{ steps.context.outputs.commit }}
+      reader_account_hash: ${{ steps.reader_identity.outputs.account_hash }}
+      reader_runner_hash: ${{ steps.reader_identity.outputs.runner_hash }}
 
     steps:
-      - name: Check out repository without persisting credentials
+      - name: Check out the exact default-branch commit without credentials
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
@@ -55,23 +55,33 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Prepare isolated canary configuration
+      - name: Bind the run to its reader identity and commit
+        id: reader_identity
         shell: pwsh
         run: |
-          # checkout cleans ignored config.json. Defaults are safe only because
-          # this runner profile contains isolated provider test accounts.
-          # A custom config must be runner-owned and outside the checkout; set
-          # USAGE_VIEWER_CANARY_CONFIG in the runner service environment.
-          if ($env:USAGE_VIEWER_CANARY_CONFIG) {
-            $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
-            $source = (Resolve-Path -LiteralPath $env:USAGE_VIEWER_CANARY_CONFIG).Path
-            if ($source.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
-              throw "USAGE_VIEWER_CANARY_CONFIG must be outside the repository checkout."
+          function Get-TextHash([string] $Value) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+              $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
+              return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+            } finally {
+              $sha.Dispose()
             }
-            Copy-Item -LiteralPath $source -Destination (Join-Path $workspace "config.json")
-          } else {
-            Write-Host "Using repository defaults with the isolated runner test profile."
           }
+          $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          "account_hash=$(Get-TextHash $account)" >> $env:GITHUB_OUTPUT
+          "runner_hash=$(Get-TextHash $env:RUNNER_NAME)" >> $env:GITHUB_OUTPUT
+
+      - name: Record the exact tested commit
+        id: context
+        shell: pwsh
+        env:
+          TESTED_COMMIT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          if ($env:TESTED_COMMIT -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "The canary commit is not a full Git object ID."
+          }
+          "commit=$($env:TESTED_COMMIT.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
       - name: Clear prior canary runtime state
         shell: pwsh
@@ -79,6 +89,7 @@ jobs:
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
           $targets = @(
             (Join-Path $workspace ".canary-artifacts"),
+            (Join-Path $workspace "config.json"),
             (Join-Path $workspace "data/raw"),
             (Join-Path $workspace "data/usage-snapshot.json"),
             (Join-Path $workspace "data/compatibility-report.json"),
@@ -87,95 +98,184 @@ jobs:
           foreach ($target in $targets) {
             $fullPath = [IO.Path]::GetFullPath($target)
             if (-not $fullPath.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
-              throw "Refusing to clean a path outside GITHUB_WORKSPACE: $fullPath"
+              throw "Refusing to clean outside GITHUB_WORKSPACE: $fullPath"
             }
             if (Test-Path -LiteralPath $fullPath) {
               Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop
             }
-            if (Test-Path -LiteralPath $fullPath) {
-              throw "Canary pre-run cleanup left runtime data behind: $fullPath"
-            }
           }
 
-      - name: Restore protected compatibility baseline
+      - name: Prepare isolated canary configuration
+        shell: pwsh
+        run: |
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          if ($env:USAGE_VIEWER_CANARY_CONFIG) {
+            $source = (Resolve-Path -LiteralPath $env:USAGE_VIEWER_CANARY_CONFIG).Path
+            if ($source.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
+              throw "USAGE_VIEWER_CANARY_CONFIG must be outside the checkout."
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $workspace "config.json")
+          } else {
+            Write-Host "Using repository defaults with the isolated provider profile."
+          }
+
+      - name: Prove the provider runner cannot write the protected baseline
+        id: baseline
         shell: pwsh
         env:
           ACCEPT_BASELINE: ${{ github.event_name == 'workflow_run' && 'true' || 'false' }}
         run: |
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
           if (-not $env:USAGE_VIEWER_CANARY_BASELINE) {
-            throw "Set USAGE_VIEWER_CANARY_BASELINE to a runner-owned path outside the checkout."
+            throw "Set USAGE_VIEWER_CANARY_BASELINE to the runner-owned canonical file."
           }
           $baseline = [IO.Path]::GetFullPath($env:USAGE_VIEWER_CANARY_BASELINE)
           if ($baseline.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
-            throw "USAGE_VIEWER_CANARY_BASELINE must be outside the repository checkout."
+            throw "The protected baseline must be outside the checkout."
           }
-          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $baseline) | Out-Null
+          $parent = Split-Path -Parent $baseline
+          if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            throw "The protected baseline directory must be provisioned by an administrator."
+          }
+
+          # Directory replacement authority is more important than a file's
+          # read-only bit. A reader that can create a sibling can replace the
+          # trust anchor, so fail the run if this write unexpectedly succeeds.
+          $probe = Join-Path $parent ".usage-viewer-reader-probe-$([Guid]::NewGuid().ToString('N'))"
+          $probeWritten = $false
+          try {
+            [IO.File]::WriteAllText($probe, "write probe")
+            $probeWritten = $true
+          } catch [UnauthorizedAccessException] {
+            Write-Host "Reader directory ACL correctly denied file creation."
+          } catch [IO.IOException] {
+            Write-Host "Reader directory ACL denied the write probe."
+          }
+          if ($probeWritten -or (Test-Path -LiteralPath $probe)) {
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+            throw "The provider runner can write the protected baseline directory."
+          }
+
+          if (Test-Path -LiteralPath $baseline -PathType Leaf) {
+            $stream = $null
+            $fileWritable = $false
+            try {
+              $stream = [IO.File]::Open(
+                $baseline,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::Write,
+                [IO.FileShare]::Read
+              )
+              $fileWritable = $true
+            } catch [UnauthorizedAccessException] {
+              Write-Host "Reader file ACL correctly denied write access."
+            } catch [IO.IOException] {
+              Write-Host "Reader file write access was denied."
+            } finally {
+              if ($stream) { $stream.Dispose() }
+            }
+            if ($fileWritable) {
+              throw "The provider runner can write the canonical baseline."
+            }
+          } elseif ($env:ACCEPT_BASELINE -ne "true") {
+            throw "No protected baseline exists; request approved baseline acceptance first."
+          }
+
           if ($env:ACCEPT_BASELINE -eq "true") {
-            Write-Host "Manual baseline acceptance requested; collecting without the previous baseline."
+            Write-Host "Collecting a fresh candidate; only the writer job may promote it."
             exit 0
-          }
-          if (-not (Test-Path -LiteralPath $baseline -PathType Leaf)) {
-            throw "No protected compatibility baseline exists. Run 'Request compatibility baseline acceptance' and approve the protected canary environment once."
           }
           New-Item -ItemType Directory -Force -Path (Join-Path $workspace "data") | Out-Null
           Copy-Item -LiteralPath $baseline -Destination (Join-Path $workspace "data/usage-snapshot.json") -ErrorAction Stop
 
-      - name: Install exact dependencies
+      - name: Install exact dependencies without lifecycle scripts
         id: dependencies
         continue-on-error: true
-        run: npm ci
+        shell: pwsh
+        run: |
+          $node = (Get-Command node.exe -ErrorAction Stop).Source
+          $toolCache = [IO.Path]::GetFullPath($env:RUNNER_TOOL_CACHE).TrimEnd('\')
+          if (-not ([IO.Path]::GetFullPath($node)).StartsWith("$toolCache\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Node.js was not resolved from the Actions tool cache."
+          }
+          $npm = Join-Path (Split-Path -Parent $node) "npm.cmd"
+          Get-ChildItem Env: | Where-Object {
+            $_.Name -match '^(?i)(ACTIONS_|GITHUB_|RUNNER_|USAGE_VIEWER_CANARY_)'
+          } | Remove-Item
+          & $npm ci --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed." }
 
-      - name: Validate restored protected baseline
+      - name: Validate the restored protected baseline
         id: baseline_validation
         if: github.event_name != 'workflow_run' && steps.dependencies.outcome == 'success'
         continue-on-error: true
-        run: npm run compatibility:baseline:validate
+        shell: pwsh
+        run: |
+          $node = (Get-Command node.exe -ErrorAction Stop).Source
+          $npm = Join-Path (Split-Path -Parent $node) "npm.cmd"
+          Get-ChildItem Env: | Where-Object {
+            $_.Name -match '^(?i)(ACTIONS_|GITHUB_|RUNNER_|USAGE_VIEWER_CANARY_)'
+          } | Remove-Item
+          & $npm --ignore-scripts run compatibility:baseline:validate
+          if ($LASTEXITCODE -ne 0) { throw "Baseline validation failed." }
 
-      - name: Run live compatibility check
+      - name: Run the live compatibility check with control variables removed
         id: canary
         if: >-
           steps.dependencies.outcome == 'success' &&
           (github.event_name == 'workflow_run' ||
            steps.baseline_validation.outcome == 'success')
         continue-on-error: true
-        run: npm run compatibility:check
-
-      - name: Persist successful protected baseline
-        id: baseline
-        if: >-
-          github.event_name == 'workflow_run' &&
-          steps.dependencies.outcome == 'success' &&
-          steps.canary.outcome == 'success'
         shell: pwsh
         run: |
-          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
-          $source = Join-Path $workspace "data/usage-snapshot.json"
-          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-            throw "Compatibility check did not produce a snapshot baseline."
-          }
-          $baseline = [IO.Path]::GetFullPath($env:USAGE_VIEWER_CANARY_BASELINE)
-          if ($baseline.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Refusing to persist a baseline inside the repository checkout."
-          }
-          $temp = "$baseline.$env:GITHUB_RUN_ID.$env:GITHUB_RUN_ATTEMPT.tmp"
-          try {
-            Copy-Item -LiteralPath $source -Destination $temp -Force -ErrorAction Stop
-            if (Test-Path -LiteralPath $baseline) {
-              $backup = "$baseline.$env:GITHUB_RUN_ID.bak"
-              try {
-                [System.IO.File]::Replace($temp, $baseline, $backup, $true)
-              } finally {
-                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-              }
-            } else {
-              [System.IO.File]::Move($temp, $baseline)
-            }
-          } finally {
-            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
-          }
+          $node = (Get-Command node.exe -ErrorAction Stop).Source
+          $npm = Join-Path (Split-Path -Parent $node) "npm.cmd"
+          $buildHost = Join-Path $PWD "scripts/build-agy-job-host.ps1"
+          Get-ChildItem Env: | Where-Object {
+            $_.Name -match '^(?i)(ACTIONS_|GITHUB_|RUNNER_|USAGE_VIEWER_CANARY_)'
+          } | Remove-Item
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $buildHost
+          if ($LASTEXITCODE -ne 0) { throw "AGY job-host build failed." }
+          & $npm --ignore-scripts run compatibility:check
+          if ($LASTEXITCODE -ne 0) { throw "Compatibility check failed." }
 
-      - name: Create redacted compatibility artifact
+      - name: Create a privacy-safe baseline candidate
+        id: candidate
+        if: github.event_name == 'workflow_run' && steps.canary.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          TESTED_COMMIT: ${{ steps.context.outputs.commit }}
+          READER_ACCOUNT_HASH: ${{ steps.reader_identity.outputs.account_hash }}
+          READER_RUNNER_HASH: ${{ steps.reader_identity.outputs.runner_hash }}
+        run: |
+          $repository = $env:GITHUB_REPOSITORY
+          $runId = $env:GITHUB_RUN_ID
+          $runAttempt = $env:GITHUB_RUN_ATTEMPT
+          $outputFile = $env:GITHUB_OUTPUT
+          $node = (Get-Command node.exe -ErrorAction Stop).Source
+          $npm = Join-Path (Split-Path -Parent $node) "npm.cmd"
+          Get-ChildItem Env: | Where-Object {
+            $_.Name -match '^(?i)(ACTIONS_|GITHUB_|RUNNER_|USAGE_VIEWER_CANARY_)'
+          } | Remove-Item
+          & $npm --ignore-scripts run compatibility:baseline:create
+          if ($LASTEXITCODE -ne 0) { throw "Candidate baseline creation failed." }
+
+          $candidate = Join-Path $PWD ".canary-artifacts/candidate-baseline.json"
+          $manifest = [ordered]@{
+            schemaVersion = 1
+            repository = $repository
+            commit = $env:TESTED_COMMIT
+            readerAccountHash = $env:READER_ACCOUNT_HASH
+            readerRunnerHash = $env:READER_RUNNER_HASH
+            candidateSha256 = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $manifest | ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $PWD ".canary-artifacts/candidate-manifest.json") -Encoding utf8
+          $artifact = "compatibility-baseline-candidate-$runId-$runAttempt"
+          "artifact_name=$artifact" >> $outputFile
+
+      - name: Create the allow-list redacted compatibility report
         id: sanitize
         if: always()
         shell: pwsh
@@ -184,26 +284,19 @@ jobs:
           DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
           BASELINE_VALIDATION_OUTCOME: ${{ steps.baseline_validation.outcome }}
           CANARY_OUTCOME: ${{ steps.canary.outcome }}
-          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
+          CANDIDATE_OUTCOME: ${{ steps.candidate.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $outputDir = Join-Path $PWD ".canary-artifacts"
           New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-          $sourcePath = Join-Path $PWD "data/compatibility-report.json"
           $source = $null
+          $sourcePath = Join-Path $PWD "data/compatibility-report.json"
           if (Test-Path -LiteralPath $sourcePath) {
-            try {
-              $source = Get-Content -Raw -LiteralPath $sourcePath | ConvertFrom-Json
-            } catch {
-              Write-Warning "Compatibility report was not valid JSON; publishing a metadata-only failure report."
-            }
+            try { $source = Get-Content -Raw -LiteralPath $sourcePath | ConvertFrom-Json } catch {}
           }
-
           $providers = @()
           if ($null -ne $source) {
             $providers = @($source.providers | ForEach-Object {
-              # Explicit allow-list: collector errors and terminal output are
-              # intentionally excluded even if a future source report adds them.
               [ordered]@{
                 provider = [string] $_.provider
                 passed = [bool] $_.passed
@@ -218,48 +311,39 @@ jobs:
               }
             })
           }
-
-          $baselinePassed = if ($env:ACCEPT_BASELINE -eq "true") {
-            $env:BASELINE_OUTCOME -eq "success"
-          } else {
-            $env:BASELINE_OUTCOME -eq "skipped"
-          }
-          $baselineValidationPassed = if ($env:ACCEPT_BASELINE -eq "true") {
-            $env:BASELINE_VALIDATION_OUTCOME -eq "skipped"
-          } else {
+          $expected = @("claude", "codex", "agy", "grok")
+          $actual = @($providers | ForEach-Object { [string] $_.provider })
+          $unique = @($actual | Sort-Object -Unique)
+          $exactProviders =
+            $actual.Count -eq 4 -and $unique.Count -eq 4 -and
+            @($expected | Where-Object { $unique -cnotcontains $_ }).Count -eq 0
+          $baselineValid =
+            $env:ACCEPT_BASELINE -eq "true" -or
             $env:BASELINE_VALIDATION_OUTCOME -eq "success"
-          }
-          $commandPassed =
+          $candidateValid =
+            $env:ACCEPT_BASELINE -ne "true" -or
+            $env:CANDIDATE_OUTCOME -eq "success"
+          $passed =
             $env:DEPENDENCY_OUTCOME -eq "success" -and
-            $baselineValidationPassed -and
+            $baselineValid -and
             $env:CANARY_OUTCOME -eq "success" -and
-            $baselinePassed
-          $reportPassed = $null -ne $source -and [bool] $source.passed
-          $expectedProviders = @("claude", "codex", "agy", "grok")
-          $actualProviders = @($providers | ForEach-Object { [string] $_.provider })
-          $uniqueProviders = @($actualProviders | Sort-Object -Unique)
-          $hasExactProviderSet =
-            $actualProviders.Count -eq $expectedProviders.Count -and
-            $uniqueProviders.Count -eq $expectedProviders.Count -and
-            @($expectedProviders | Where-Object { $uniqueProviders -cnotcontains $_ }).Count -eq 0 -and
-            @($uniqueProviders | Where-Object { $expectedProviders -cnotcontains $_ }).Count -eq 0
-          $redacted = [ordered]@{
+            $candidateValid -and
+            $null -ne $source -and [bool] $source.passed -and
+            $exactProviders
+          [ordered]@{
             schemaVersion = 1
             redacted = $true
-            generatedAt = if ($null -ne $source) { [string] $source.generatedAt } else { (Get-Date).ToUniversalTime().ToString("o") }
-            passed = $commandPassed -and $reportPassed -and $hasExactProviderSet
+            generatedAt = if ($source) { [string] $source.generatedAt } else { (Get-Date).ToUniversalTime().ToString("o") }
+            passed = $passed
             workflowRun = $env:RUN_URL
             providers = $providers
-          }
-          $redacted | ConvertTo-Json -Depth 6 |
+          } | ConvertTo-Json -Depth 6 |
             Set-Content -LiteralPath (Join-Path $outputDir "compatibility-report.json") -Encoding utf8
-          "passed=$($redacted.passed.ToString().ToLowerInvariant())" |
-            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          "passed=$($passed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
-      - name: Upload redacted compatibility report only
+      - name: Upload the redacted compatibility report only
         id: report_upload
         if: always() && steps.sanitize.outcome == 'success'
-        # Never broaden this path to data/**: runtime snapshots are private.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: redacted-compatibility-report-${{ github.run_id }}-${{ github.run_attempt }}
@@ -267,178 +351,250 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Open, update, or close the compatibility issue
-        id: issue_sync
+      - name: Upload the approved-run candidate separately
+        id: candidate_upload
+        if: >-
+          github.event_name == 'workflow_run' &&
+          steps.candidate.outcome == 'success' &&
+          steps.sanitize.outputs.passed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.candidate.outputs.artifact_name }}
+          path: |
+            .canary-artifacts/candidate-baseline.json
+            .canary-artifacts/candidate-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove provider runtime artifacts
         if: always()
+        shell: pwsh
+        run: |
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          $targets = @(
+            (Join-Path $workspace ".canary-artifacts"),
+            (Join-Path $workspace "config.json"),
+            (Join-Path $workspace "data/raw"),
+            (Join-Path $workspace "data/usage-snapshot.json"),
+            (Join-Path $workspace "data/compatibility-report.json"),
+            (Join-Path $workspace "data/refresh.lock")
+          )
+          foreach ($target in $targets) {
+            $fullPath = [IO.Path]::GetFullPath($target)
+            if (-not $fullPath.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Refusing to clean outside GITHUB_WORKSPACE: $fullPath"
+            }
+            if (Test-Path -LiteralPath $fullPath) {
+              Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop
+            }
+          }
+
+      - name: Fail after publishing redacted diagnostics
+        if: >-
+          always() &&
+          (steps.sanitize.outcome != 'success' ||
+           steps.sanitize.outputs.passed != 'true' ||
+           steps.report_upload.outcome != 'success' ||
+           (github.event_name == 'workflow_run' &&
+            steps.candidate_upload.outcome != 'success'))
+        shell: pwsh
+        run: throw "Provider compatibility canary failed; see the redacted artifact."
+
+  promote-baseline:
+    name: Promote the approved structural baseline
+    needs: compatibility
+    if: >-
+      github.event_name == 'workflow_run' &&
+      needs.compatibility.result == 'success' &&
+      needs.compatibility.outputs.canary_passed == 'true'
+    # This is a second runner service and a different Windows account. It has
+    # no provider logins and never checks out or executes repository code.
+    runs-on: [self-hosted, Windows, X64, usage-viewer-canary-writer]
+    environment: compatibility-canary
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download only this run's candidate artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.compatibility.outputs.candidate_artifact }}
+          path: .candidate
+
+      - name: Validate provenance, re-check main, and atomically promote
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          CANARY_FAILED: ${{ steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success' }}
-          DEPENDENCY_OUTCOME: ${{ steps.dependencies.outcome }}
-          BASELINE_VALIDATION_OUTCOME: ${{ steps.baseline_validation.outcome }}
-          CANARY_OUTCOME: ${{ steps.canary.outcome }}
-          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          COMMIT_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          TESTED_COMMIT: ${{ needs.compatibility.outputs.tested_commit }}
+          READER_ACCOUNT_HASH: ${{ needs.compatibility.outputs.reader_account_hash }}
+          READER_RUNNER_HASH: ${{ needs.compatibility.outputs.reader_runner_hash }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          function Get-TextHash([string] $Value) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+              $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
+              return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+            } finally {
+              $sha.Dispose()
+            }
+          }
+          function Assert-ExactKeys($Value, [string[]] $Expected, [string] $Label) {
+            $actual = @($Value.PSObject.Properties.Name | Sort-Object)
+            $wanted = @($Expected | Sort-Object)
+            if (($actual -join "`0") -cne ($wanted -join "`0")) {
+              throw "$Label has an unexpected field inventory."
+            }
+          }
+
+          $writerAccountHash = Get-TextHash ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+          $writerRunnerHash = Get-TextHash $env:RUNNER_NAME
+          if ($writerAccountHash -ceq $env:READER_ACCOUNT_HASH -or
+              $writerRunnerHash -ceq $env:READER_RUNNER_HASH) {
+            throw "Baseline promotion must use a different runner and Windows account."
+          }
+
+          $candidate = Join-Path $PWD ".candidate/candidate-baseline.json"
+          $manifestPath = Join-Path $PWD ".candidate/candidate-manifest.json"
+          if ((Get-Item -LiteralPath $candidate).Length -gt 1MB) {
+            throw "Candidate baseline is unexpectedly large."
+          }
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          Assert-ExactKeys $manifest @(
+            "schemaVersion", "repository", "commit", "readerAccountHash",
+            "readerRunnerHash", "candidateSha256"
+          ) "Candidate manifest"
+          if ([int]$manifest.schemaVersion -ne 1 -or
+              [string]$manifest.repository -cne $env:GITHUB_REPOSITORY -or
+              [string]$manifest.commit -cne $env:TESTED_COMMIT -or
+              [string]$manifest.readerAccountHash -cne $env:READER_ACCOUNT_HASH -or
+              [string]$manifest.readerRunnerHash -cne $env:READER_RUNNER_HASH) {
+            throw "Candidate provenance does not match this workflow run."
+          }
+          $candidateHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($candidateHash -cne [string]$manifest.candidateSha256) {
+            throw "Candidate baseline hash mismatch."
+          }
+
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
             Accept = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
           }
-          function Invoke-GitHubApi {
-            param(
-              [Parameter(Mandatory)] [string] $Method,
-              [Parameter(Mandatory)] [string] $Uri,
-              [object] $Body = $null
-            )
-            $request = @{
-              Method = $Method
-              Uri = $Uri
-              Headers = $headers
-              TimeoutSec = 30
-            }
-            if ($null -ne $Body) {
-              $request.ContentType = "application/json"
-              $request.Body = $Body | ConvertTo-Json -Depth 8
-            }
-            Invoke-RestMethod @request
-          }
-
-          $repo = $env:GITHUB_REPOSITORY
-          $api = $env:GITHUB_API_URL.TrimEnd('/')
-          $label = "compatibility-canary"
-          $title = "[canary] Provider compatibility drift detected"
-          $encodedLabel = [Uri]::EscapeDataString($label)
-
-          try {
-            Invoke-GitHubApi -Method Get -Uri "$api/repos/$repo/labels/$encodedLabel" | Out-Null
-          } catch {
-            $status = if ($null -ne $_.Exception.Response) { [int] $_.Exception.Response.StatusCode } else { 0 }
-            if ($status -ne 404) { throw }
-            Invoke-GitHubApi -Method Post -Uri "$api/repos/$repo/labels" -Body @{
-              name = $label
-              color = "b60205"
-              description = "Managed alert for the isolated provider compatibility canary"
-            } | Out-Null
-          }
-
-          $issues = @(Invoke-GitHubApi -Method Get -Uri "$api/repos/$repo/issues?state=all&labels=$encodedLabel&per_page=100&sort=created&direction=desc")
-          $matches = @($issues | Where-Object {
-            $null -eq $_.pull_request -and [string] $_.title -ceq $title
-          })
-          $managedIssue = $matches | Select-Object -First 1
-
-          $providerRows = @()
-          $redactedPath = Join-Path $PWD ".canary-artifacts/compatibility-report.json"
-          if (Test-Path -LiteralPath $redactedPath) {
-            try {
-              $report = Get-Content -Raw -LiteralPath $redactedPath | ConvertFrom-Json
-              $providerRows = @($report.providers | ForEach-Object {
-                "| $($_.provider) | $($_.state) | $($_.attemptState) | $($_.rowCount) | $($_.adapterVersion) |"
-              })
-            } catch {
-              $providerRows = @()
+          $branch = [Uri]::EscapeDataString($env:DEFAULT_BRANCH)
+          function Assert-MainUnchanged {
+            $main = Invoke-RestMethod -Headers $headers -TimeoutSec 30 `
+              -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/commits/$branch"
+            if ([string]$main.sha -cne $env:TESTED_COMMIT) {
+              throw "The default branch advanced after the candidate was tested."
             }
           }
-          if ($providerRows.Count -eq 0) {
-            $providerRows = @("| _No redacted provider results available_ | - | - | - | - |")
+          Assert-MainUnchanged
+
+          $baselineValue = Get-Content -Raw -LiteralPath $candidate | ConvertFrom-Json
+          Assert-ExactKeys $baselineValue @("generatedAt", "timezone", "collectors", "limits") "Baseline"
+          $generatedAt = [DateTime]::Parse([string]$baselineValue.generatedAt).ToUniversalTime().ToString("o")
+          if ([string]$baselineValue.timezone -notmatch '^[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*$') {
+            throw "Baseline timezone is not a safe IANA identifier."
           }
-
-          $result = if ($env:CANARY_FAILED -eq "true") { "FAILED" } else { "RECOVERED" }
-          $body = @"
-          <!-- usage-viewer-compatibility-canary -->
-          This issue is managed automatically by the isolated provider compatibility canary.
-
-          - **Latest result:** $result
-          - **Dependency install:** $env:DEPENDENCY_OUTCOME
-          - **Protected baseline validation:** $env:BASELINE_VALIDATION_OUTCOME
-          - **Compatibility command:** $env:CANARY_OUTCOME
-          - **Protected baseline:** $env:BASELINE_OUTCOME
-          - **Commit:** ``$env:COMMIT_SHA``
-          - **Run:** [Open workflow run]($env:RUN_URL)
-
-          | Provider | State | Attempt | Rows | Adapter |
-          | --- | --- | --- | ---: | --- |
-          $($providerRows -join "`n")
-
-          The uploaded artifact is allow-list redacted. Provider transcripts are not persisted or uploaded.
-          "@
-
-          if ($env:CANARY_FAILED -eq "true") {
-            if ($null -eq $managedIssue) {
-              $managedIssue = Invoke-GitHubApi -Method Post -Uri "$api/repos/$repo/issues" -Body @{
-                title = $title
-                body = $body
-                labels = @($label)
-              }
-            } else {
-              Invoke-GitHubApi -Method Patch -Uri "$api/repos/$repo/issues/$($managedIssue.number)" -Body @{
-                state = "open"
-                title = $title
-                body = $body
-                labels = @($label)
-              } | Out-Null
-            }
-
-            # Enforce one managed open issue even if an old run was duplicated.
-            $matches | Where-Object {
-              $_.number -ne $managedIssue.number -and $_.state -eq "open"
-            } | ForEach-Object {
-              Invoke-GitHubApi -Method Patch -Uri "$api/repos/$repo/issues/$($_.number)" -Body @{
-                state = "closed"
-                state_reason = "not_planned"
-              } | Out-Null
-            }
-          } else {
-            $matches | Where-Object { $_.state -eq "open" } | ForEach-Object {
-              Invoke-GitHubApi -Method Patch -Uri "$api/repos/$repo/issues/$($_.number)" -Body @{
-                state = "closed"
-                state_reason = "completed"
-                body = $body
-              } | Out-Null
+          $providers = @("claude", "codex", "agy", "grok")
+          $labels = @{
+            claude = "Claude Code"
+            codex = "Codex"
+            agy = "Antigravity"
+            grok = "Grok"
+          }
+          $collectors = @($baselineValue.collectors)
+          if ($collectors.Count -ne 4) { throw "Baseline must contain four collectors." }
+          foreach ($provider in $providers) {
+            $matches = @($collectors | Where-Object { [string]$_.provider -ceq $provider })
+            if ($matches.Count -ne 1) { throw "Baseline collector inventory is invalid." }
+            $collector = $matches[0]
+            Assert-ExactKeys $collector @(
+              "provider", "enabled", "ok", "state", "attemptState", "checkedAt",
+              "durationMs", "adapterVersion", "formatFingerprint",
+              "formatChanged", "rowInventoryChanged"
+            ) "$provider collector"
+            if (-not [bool]$collector.enabled -or -not [bool]$collector.ok -or
+                [string]$collector.state -cne "ok" -or
+                [string]$collector.attemptState -cne "ok" -or
+                [int]$collector.durationMs -ne 0 -or
+                [string]$collector.checkedAt -cne [string]$baselineValue.generatedAt -or
+                [string]$collector.adapterVersion -notmatch '^\d+\.\d+\.\d+$' -or
+                [string]$collector.formatFingerprint -notmatch '^[0-9a-f]{16}$' -or
+                [bool]$collector.formatChanged -or [bool]$collector.rowInventoryChanged) {
+              throw "$provider collector is not a redacted passing contract."
             }
           }
 
-      - name: Remove workspace runtime artifacts
-        if: always()
-        shell: pwsh
-        run: |
-          # Remove only known runtime files inside this checkout. In particular,
-          # never leave PTY transcripts or either compatibility report behind.
+          $limits = @($baselineValue.limits)
+          if ($limits.Count -lt 4 -or $limits.Count -gt 100) {
+            throw "Baseline row count is outside the accepted range."
+          }
+          $ids = @{}
+          foreach ($row in $limits) {
+            Assert-ExactKeys $row @(
+              "id", "provider", "providerLabel", "scope", "window",
+              "usedPercent", "remainingPercent", "status", "freshness",
+              "informational", "sourceCommand", "sourceText", "checkedAt"
+            ) "Baseline row"
+            $provider = [string]$row.provider
+            $id = [string]$row.id
+            if ($providers -cnotcontains $provider -or
+                $id -notmatch "^$provider`:[a-z0-9][a-z0-9:-]{0,158}$" -or
+                $ids.ContainsKey($id)) {
+              throw "Baseline row identity is invalid or duplicated."
+            }
+            $ids[$id] = $true
+            if ([string]$row.providerLabel -cne $labels[$provider] -or
+                [string]$row.scope -cne $id -or
+                [string]$row.window -notmatch '^[a-z0-9][a-z0-9-]{0,63}$' -or
+                [double]$row.usedPercent -ne 0 -or
+                [double]$row.remainingPercent -ne 100 -or
+                [string]$row.status -cne "available" -or
+                [string]$row.freshness -cne "verified" -or
+                [string]$row.sourceCommand -cne "protected compatibility baseline" -or
+                [string]$row.sourceText -cne "$id structural contract" -or
+                [string]$row.checkedAt -cne [string]$baselineValue.generatedAt) {
+              throw "Baseline row contains non-structural data."
+            }
+          }
+          foreach ($provider in $providers) {
+            $actionable = @($limits | Where-Object {
+              [string]$_.provider -ceq $provider -and -not [bool]$_.informational
+            })
+            if ($actionable.Count -eq 0) {
+              throw "$provider has no actionable structural row."
+            }
+          }
+
           $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
-          $dataDir = Join-Path $workspace "data"
-          $atomicTempTargets = @()
-          if (Test-Path -LiteralPath $dataDir) {
-            $atomicTempTargets = @(Get-ChildItem -LiteralPath $dataDir -File -Force -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.Name -match '^(usage-snapshot\.json|compatibility-report\.json)\.\d+\.tmp$' -or
-                $_.Name -match '^refresh\.lock\.[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.tmp$'
-              } |
-              ForEach-Object { $_.FullName })
+          if (-not $env:USAGE_VIEWER_CANARY_BASELINE) {
+            throw "The writer runner has no canonical baseline path."
           }
-          $targets = @(
-            (Join-Path $workspace ".canary-artifacts"),
-            (Join-Path $workspace "data/raw"),
-            (Join-Path $workspace "data/usage-snapshot.json"),
-            (Join-Path $workspace "data/compatibility-report.json"),
-            (Join-Path $workspace "data/refresh.lock"),
-            (Join-Path $workspace "config.json")
-          ) + $atomicTempTargets
-          foreach ($target in $targets) {
-            $fullPath = [IO.Path]::GetFullPath($target)
-            if (-not $fullPath.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
-              throw "Refusing to clean a path outside GITHUB_WORKSPACE: $fullPath"
-            }
-            if (Test-Path -LiteralPath $fullPath) {
-              Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop
-            }
-            if (Test-Path -LiteralPath $fullPath) {
-              throw "Canary cleanup left runtime data behind: $fullPath"
-            }
+          $baseline = [IO.Path]::GetFullPath($env:USAGE_VIEWER_CANARY_BASELINE)
+          if ($baseline.StartsWith("$workspace\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to promote a baseline inside GITHUB_WORKSPACE."
           }
-
-      - name: Fail after recording a canary failure
-        if: always() && (steps.sanitize.outcome != 'success' || steps.sanitize.outputs.passed != 'true' || steps.report_upload.outcome != 'success')
-        shell: pwsh
-        run: throw "Provider compatibility canary failed; the managed issue and redacted artifact were updated."
+          $parent = Split-Path -Parent $baseline
+          if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            throw "The writer baseline directory was not provisioned."
+          }
+          # Re-check immediately before the atomic replacement. Candidate
+          # validation can take time, and approval must never move a stale
+          # contract over a newer default-branch commit.
+          Assert-MainUnchanged
+          $temp = Join-Path $parent ".usage-viewer-baseline-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.tmp"
+          $backup = "$baseline.$env:GITHUB_RUN_ID.bak"
+          try {
+            Copy-Item -LiteralPath $candidate -Destination $temp -ErrorAction Stop
+            if (Test-Path -LiteralPath $baseline -PathType Leaf) {
+              [IO.File]::Replace($temp, $baseline, $backup, $true)
+            } else {
+              [IO.File]::Move($temp, $baseline)
+            }
+          } finally {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+          }

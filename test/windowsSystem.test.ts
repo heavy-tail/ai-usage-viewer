@@ -66,6 +66,11 @@ describe("trusted Windows system utilities", () => {
         PATHEXT: ".JS",
         node_options: "--require C:\\Untrusted\\inject.js",
         NPM_CONFIG_SCRIPT_SHELL: "C:\\Untrusted\\shell.exe",
+        GITHUB_TOKEN: "repository-token",
+        GitHub_Workspace: "C:\\actions\\workspace",
+        ACTIONS_RUNTIME_TOKEN: "actions-token",
+        RUNNER_NAME: "provider-runner",
+        USAGE_VIEWER_CANARY_BASELINE: "C:\\protected\\baseline.json",
       },
       "win32"
     );
@@ -83,5 +88,10 @@ describe("trusted Windows system utilities", () => {
       )
     ).toBe(false);
     expect(environment.NPM_CONFIG_SCRIPT_SHELL).toBeUndefined();
+    expect(environment.GITHUB_TOKEN).toBeUndefined();
+    expect(environment.GitHub_Workspace).toBeUndefined();
+    expect(environment.ACTIONS_RUNTIME_TOKEN).toBeUndefined();
+    expect(environment.RUNNER_NAME).toBeUndefined();
+    expect(environment.USAGE_VIEWER_CANARY_BASELINE).toBeUndefined();
   });
 });

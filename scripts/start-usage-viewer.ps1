@@ -1,6 +1,7 @@
 param(
   [switch] $ServerOnly,
-  [switch] $SkipLaunchRefresh
+  [switch] $SkipLaunchRefresh,
+  [string] $VerifyServerCommandLine
 )
 
 $ErrorActionPreference = "Stop"
@@ -315,85 +316,46 @@ function Test-ViewerServerCommand {
   param([string] $CommandLine)
 
   $arguments = @(ConvertFrom-WindowsCommandLine -CommandLine $CommandLine)
-  if ($arguments.Count -lt 2) {
+  # The managed server has one canonical argv. Accepting "any trusted loader
+  # somewhere before server.ts" lets an extra preload execute arbitrary code
+  # while still passing identity verification.
+  if ($arguments.Count -ne 6) {
     return $false
   }
 
+  if ([string]$arguments[1] -cne "--require" -or
+      [string]$arguments[3] -cne "--import") {
+    return $false
+  }
+
+  $preflightPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $RootDir "node_modules\tsx\dist\preflight.cjs")
+  ).TrimEnd("\")
+  $loaderPath = [System.IO.Path]::GetFullPath(
+    (Join-Path $RootDir "node_modules\tsx\dist\loader.mjs")
+  ).TrimEnd("\")
   $serverEntry = [System.IO.Path]::GetFullPath(
     (Join-Path $RootDir "src\server.ts")
   ).TrimEnd("\")
-  $runtimeRoot = [System.IO.Path]::GetFullPath(
-    (Join-Path $RootDir "node_modules\tsx\dist")
-  ).TrimEnd("\")
-  $runtimePrefix = "$runtimeRoot\"
-  $entryPoint = $null
-  $hasRepoRuntimeLoader = $false
+  $actualPreflight = Resolve-ViewerCommandFileArgument `
+    -Argument ([string]$arguments[2])
+  $actualLoader = Resolve-ViewerCommandFileArgument `
+    -Argument ([string]$arguments[4])
+  $actualEntry = Resolve-ViewerCommandFileArgument `
+    -Argument ([string]$arguments[5])
 
-  for ($index = 1; $index -lt $arguments.Count; $index++) {
-    $argument = [string]$arguments[$index]
-
-    # Only a value attached to Node's actual loader switches can prove that
-    # this checkout's tsx runtime is active. A path supplied as an arbitrary
-    # application argument is not authority to terminate the listener.
-    $loaderArgument = $null
-    if ($argument -match '^(?i)--(?:import|require)=(.+)$') {
-      $loaderArgument = $Matches[1]
-    } elseif ($argument -in @("--import", "--require", "-r")) {
-      if ($index + 1 -ge $arguments.Count) {
-        return $false
-      }
-      $index++
-      $loaderArgument = [string]$arguments[$index]
-    }
-
-    if ($loaderArgument) {
-      $canonicalLoader = Resolve-ViewerCommandFileArgument `
-        -Argument $loaderArgument
-      if ($canonicalLoader -and $canonicalLoader.StartsWith(
-            $runtimePrefix,
-            [System.StringComparison]::OrdinalIgnoreCase
-          )) {
-        $hasRepoRuntimeLoader = $true
-      }
-      continue
-    }
-
-    # Fail closed when Node is running code through an alternate execution
-    # mode. In those modes a later server.ts token can be only an argument,
-    # not the program that owns the listener.
-    if ($argument -match '^(?i)(?:-e(?:$|=|[^-])|--eval(?:$|=)|-p(?:$|=|[^-])|--print(?:$|=)|-c$|--check$|--run(?:$|=)|--test(?:$|=|-))') {
-      return $false
-    }
-
-    # A lone dash executes JavaScript from stdin. After Node's end-of-options
-    # marker, the very next token is the entry point even when it starts with
-    # a dash; never interpret later tokens as Node loader switches.
-    if ($argument -eq "-") {
-      return $false
-    }
-    if ($argument -eq "--") {
-      if ($index + 1 -ge $arguments.Count) {
-        return $false
-      }
-      $index++
-      $entryPoint = Resolve-ViewerCommandFileArgument `
-        -Argument ([string]$arguments[$index])
-      break
-    }
-
-    # Remaining dash-prefixed values are Node flags. The first non-option
-    # token is Node's actual application entry point; ignore all later
-    # application arguments so decoy paths cannot satisfy this proof.
-    if ($argument.StartsWith("-", [System.StringComparison]::Ordinal)) {
-      continue
-    }
-    $entryPoint = Resolve-ViewerCommandFileArgument -Argument $argument
-    break
-  }
-
-  return $hasRepoRuntimeLoader -and
-    $entryPoint -and
-    $entryPoint.Equals(
+  return $actualPreflight -and
+    $actualLoader -and
+    $actualEntry -and
+    $actualPreflight.Equals(
+      $preflightPath,
+      [System.StringComparison]::OrdinalIgnoreCase
+    ) -and
+    $actualLoader.Equals(
+      $loaderPath,
+      [System.StringComparison]::OrdinalIgnoreCase
+    ) -and
+    $actualEntry.Equals(
       $serverEntry,
       [System.StringComparison]::OrdinalIgnoreCase
     )
@@ -528,16 +490,25 @@ function Stop-VerifiedServerProcess {
 
   $taskkillPath = Join-Path $env:SystemRoot "System32\taskkill.exe"
   & $taskkillPath /pid $expectedPid /T /F | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Could not restart the verified AI Usage Viewer server."
-  }
+  $taskkillExitCode = $LASTEXITCODE
 
   $deadline = (Get-Date).AddSeconds(10)
   while ((Get-Date) -lt $deadline -and (Test-ViewerPortOpen)) {
     Start-Sleep -Milliseconds 250
   }
-  if (Test-ViewerPortOpen) {
-    throw "The verified AI Usage Viewer server did not release port 4317."
+  $rootStillRunning = $false
+  try {
+    $remaining = Get-Process -Id $expectedPid -ErrorAction Stop
+    $rootStillRunning =
+      [Math]::Abs(
+        ($remaining.StartTime.ToUniversalTime() -
+          [DateTime]::Parse($expectedStart).ToUniversalTime()).TotalSeconds
+      ) -le 5
+  } catch {
+    $rootStillRunning = $false
+  }
+  if ((Test-ViewerPortOpen) -or $rootStillRunning) {
+    throw "The verified AI Usage Viewer server did not stop (taskkill exit $taskkillExitCode)."
   }
   Remove-Item -LiteralPath $ServerStatePath -Force -ErrorAction SilentlyContinue
 }
@@ -651,7 +622,7 @@ function Stop-FailedSpawnedServer {
         $taskkillPath = Join-Path $env:SystemRoot "System32\taskkill.exe"
         & $taskkillPath /pid ([int]$LauncherProcess.Id) /T /F | Out-Null
         if ($LASTEXITCODE -ne 0) {
-          $cleanupFailures += "the newly spawned npm process tree did not stop"
+          $cleanupFailures += "the newly spawned Node process tree did not stop"
         }
       }
     } catch {
@@ -814,19 +785,44 @@ $payloadJson = [System.Text.Encoding]::UTF8.GetString(
 )
 $payload = $payloadJson | ConvertFrom-Json
 $refreshUrl = [string]$payload.refreshUrl
+$snapshotUrl = ([Uri]$refreshUrl).GetLeftPart([System.UriPartial]::Authority) + "/api/snapshot"
 $successLog = [string]$payload.successLog
 $errorLog = [string]$payload.errorLog
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 try {
-  Invoke-RestMethod `
-    -Uri ([Uri]$refreshUrl) `
-    -Method Post `
-    -TimeoutSec 60 | Out-Null
-  [System.IO.File]::WriteAllText(
-    $successLog,
-    "Refresh completed at $((Get-Date).ToString("s"))",
-    $utf8
-  )
+  try {
+    Invoke-RestMethod `
+      -Uri ([Uri]$refreshUrl) `
+      -Method Post `
+      -TimeoutSec 10 | Out-Null
+  } catch {
+    $status = if ($null -ne $_.Exception.Response) {
+      [int]$_.Exception.Response.StatusCode
+    } else {
+      0
+    }
+    if ($status -ne 409) {
+      throw
+    }
+  }
+
+  $deadline = (Get-Date).AddMinutes(5)
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 2
+    $state = Invoke-RestMethod -Uri ([Uri]$snapshotUrl) -TimeoutSec 10
+    if (-not [bool]$state.refreshing) {
+      if ($state.error) {
+        throw ([string]$state.error)
+      }
+      [System.IO.File]::WriteAllText(
+        $successLog,
+        "Refresh completed at $((Get-Date).ToString("s"))",
+        $utf8
+      )
+      exit 0
+    }
+  }
+  throw "Refresh verification timed out after 5 minutes."
 } catch {
   [System.IO.File]::WriteAllText($errorLog, $_.Exception.Message, $utf8)
 }
@@ -883,8 +879,6 @@ try {
 
 function Find-AppBrowser {
   $candidates = @(
-    (Get-Command "msedge.exe" -ErrorAction SilentlyContinue).Source,
-    (Get-Command "chrome.exe" -ErrorAction SilentlyContinue).Source,
     (Join-Path ${env:ProgramFiles(x86)} "Microsoft/Edge/Application/msedge.exe"),
     (Join-Path $env:ProgramFiles "Microsoft/Edge/Application/msedge.exe"),
     (Join-Path $env:ProgramFiles "Google/Chrome/Application/chrome.exe"),
@@ -892,7 +886,7 @@ function Find-AppBrowser {
   )
 
   return $candidates |
-    Where-Object { $_ -and (Test-Path $_) } |
+    Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
     Select-Object -First 1
 }
 
@@ -906,6 +900,13 @@ function Open-AppWindow {
   }
 
   Start-Process $Url
+}
+
+if ($PSBoundParameters.ContainsKey("VerifyServerCommandLine")) {
+  if (Test-ViewerServerCommand -CommandLine $VerifyServerCommandLine) {
+    exit 0
+  }
+  exit 1
 }
 
 $LauncherMutex = [System.Threading.Mutex]::new(

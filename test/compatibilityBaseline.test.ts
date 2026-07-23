@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { compatibilityBaselineIssues } from "../src/compatibilityBaseline";
+import {
+  compatibilityBaselineIssues,
+  redactedCompatibilityBaseline,
+} from "../src/compatibilityBaseline";
 import type { UsageSnapshot } from "../src/types";
 
 const config = {
@@ -22,6 +25,43 @@ describe("protected compatibility baseline", () => {
     expect(compatibilityBaselineIssues(stale, config)).toContain(
       "claude contains unverified rows"
     );
+  });
+
+  it("creates a structural baseline without account or quota data", () => {
+    const source = snapshot();
+    source.limits[0] = {
+      ...source.limits[0],
+      planLabel: "Private plan",
+      accountLabel: "person@example.com",
+      resetLabel: "Resets Jul 30, 4pm",
+      resetAt: "2026-07-30T07:00:00.000Z",
+      sourceText: "Private provider output 73% used",
+      checkedAt: "2026-07-19T00:01:00.000Z",
+    };
+
+    const baseline = redactedCompatibilityBaseline(source);
+    const serialized = JSON.stringify(baseline);
+
+    expect(compatibilityBaselineIssues(baseline, config)).toEqual([]);
+    expect(serialized).not.toContain("person@example.com");
+    expect(serialized).not.toContain("Private plan");
+    expect(serialized).not.toContain("73%");
+    expect(serialized).not.toContain("Jul 30");
+    expect(baseline.limits[0]).toEqual({
+      id: "claude:session",
+      provider: "claude",
+      providerLabel: "Claude Code",
+      scope: "claude:session",
+      window: "structural",
+      usedPercent: 0,
+      remainingPercent: 100,
+      status: "available",
+      freshness: "verified",
+      informational: false,
+      sourceCommand: "protected compatibility baseline",
+      sourceText: "claude:session structural contract",
+      checkedAt: source.generatedAt,
+    });
   });
 });
 

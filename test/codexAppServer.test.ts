@@ -413,6 +413,45 @@ describe("Codex structured rate-limit parser", () => {
     });
   });
 
+  it("applies a single-view spend-control stop to every multi-bucket row", () => {
+    const payload = rateLimitPayload();
+    const single = payload.rateLimits as Record<string, unknown>;
+    single.spendControlReached = true;
+
+    const limits = parseCodexAppServerRateLimits(payload, meta);
+
+    expect(limits.length).toBeGreaterThan(1);
+    expect(limits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "codex:5h",
+          status: "exhausted",
+          blockingReason: "Workspace spending limit reached",
+        }),
+        expect.objectContaining({
+          id: "codex:codex-other:1h",
+          status: "exhausted",
+          blockingReason: "Workspace spending limit reached",
+        }),
+      ])
+    );
+  });
+
+  it("rejects conflicting single-view and per-bucket spend controls", () => {
+    const payload = rateLimitPayload();
+    const single = payload.rateLimits as Record<string, unknown>;
+    single.spendControlReached = true;
+    const buckets = payload.rateLimitsByLimitId as Record<
+      string,
+      Record<string, unknown>
+    >;
+    buckets.codex.spendControlReached = false;
+
+    expect(() => parseCodexAppServerRateLimits(payload, meta)).toThrow(
+      ParserDriftError
+    );
+  });
+
   it("applies the current per-bucket spend-control hard stop only to its bucket", () => {
     const payload = rateLimitPayload();
     const buckets = payload.rateLimitsByLimitId as Record<

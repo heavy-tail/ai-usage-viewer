@@ -11,6 +11,8 @@ const CLAUDE_FRAME_START_RE = /^[\t ]*Current session[\t ]*$/gim;
 const CLAUDE_CREDITS_HEADING_RE = /^[\t ]*Usage credits[\t ]*$/gim;
 const CLAUDE_COMPLETE_CREDITS_RE =
   /^[\t ]*Usage credits[\t ]*\r?\n[^\r\n]*(?:Usage credits are off|\d+(?:\.\d+)?%\s+used)[^\r\n]*$/gim;
+const CLAUDE_CONTRIBUTION_HEADING_RE =
+  /^[\t ]*What's contributing to your limits usage\?[\t ]*$/gim;
 const USED_PERCENT_RE = /(\d+(?:\.\d+)?)%\s+used\b/gi;
 const CREDITS_OFF_RE = /\bUsage credits are off\b/i;
 const MAX_RESET_LABEL_LENGTH = 128;
@@ -136,18 +138,35 @@ export function parseClaudeUsage(text: string, meta: ParserMeta): UsageLimit[] {
     );
   }
 
-  const incomplete = [...latestById.values()].some(
-    (state) => state.kind === "incomplete"
+  const incompleteIds = [...latestById.entries()]
+    .filter(([, state]) => state.kind === "incomplete")
+    .map(([id]) => id);
+  const incomplete = incompleteIds.length > 0;
+  const contributionPercentOffsets =
+    claudeContributionPercentOffsets(frameText);
+  const unclaimedPercents = allMatches(frameText, USED_PERCENT_RE).filter(
+    (match) =>
+      !claimedPercentOffsets.has(match.index) &&
+      !contributionPercentOffsets.has(match.index)
   );
-  const unclaimedPercent = allMatches(frameText, USED_PERCENT_RE).find(
-    (match) => !claimedPercentOffsets.has(match.index)
-  );
+  const unclaimedPercent = unclaimedPercents[0];
   const missingReset = [session, weekAll].find(
     (section) => section.requiredReset && !section.resetLabel
   );
   if (incomplete || unclaimedPercent || missingReset) {
+    const diagnostics = [
+      incomplete
+        ? `incomplete rows: ${incompleteIds.join(", ")}`
+        : undefined,
+      unclaimedPercent
+        ? `unclaimed usage percentages: ${unclaimedPercents
+            .map((match) => `${match[1]}%`)
+            .join(", ")}`
+        : undefined,
+      missingReset ? `missing reset: ${missingReset.id}` : undefined,
+    ].filter(Boolean);
     throw new ParserDriftError(
-      "Claude usage output contained an incomplete or unrecognized usage section.",
+      `Claude usage output contained an incomplete or unrecognized usage section (${diagnostics.join("; ")}).`,
       frameText
     );
   }
@@ -221,6 +240,20 @@ function completeClaudeFramePrefix(frame: string): string | undefined {
   // Do not let the semantic end marker hide a newly added percentage section.
   // Only known cancellation redraw debris may be discarded.
   return hasUnknownTrailingPercent ? frame : frame.slice(0, end);
+}
+
+function claudeContributionPercentOffsets(text: string): Set<number> {
+  const ignored = new Set<number>();
+  for (const heading of allMatches(text, CLAUDE_CONTRIBUTION_HEADING_RE)) {
+    const afterHeading = text.slice(heading.index + heading[0].length);
+    const credits = firstMatch(afterHeading, CLAUDE_CREDITS_HEADING_RE);
+    if (!credits) continue;
+    const panel = afterHeading.slice(0, credits.index);
+    for (const percent of allMatches(panel, USED_PERCENT_RE)) {
+      ignored.add(heading.index + heading[0].length + percent.index);
+    }
+  }
+  return ignored;
 }
 
 function validatedResetLabel(

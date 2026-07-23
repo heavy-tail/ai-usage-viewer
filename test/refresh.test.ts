@@ -386,7 +386,7 @@ describe("refresh service", () => {
       ok: false,
       state: "stale",
       attemptState: "drift",
-      adapterVersion: "2.6.0",
+      adapterVersion: "2.7.0",
       error: expect.stringContaining("Adapter contract rejected"),
     });
     expect(snapshot.limits).toHaveLength(1);
@@ -514,9 +514,70 @@ describe("refresh service", () => {
     ]);
   });
 
-  it("publishes validated rows from an intentional adapter upgrade while flagging canary acceptance", async () => {
+  it("does not let an adapter version bump authorize an undeclared row change", async () => {
     const rootDir = await tempWorkspace(["claude"]);
     const service = createRefreshService();
+
+    await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => okResult("claude", [limit("claude")]),
+      },
+    });
+    const snapshotPath = join(rootDir, "data", "usage-snapshot.json");
+    const previous = JSON.parse(await readFile(snapshotPath, "utf8")) as {
+      collectors: Array<{ provider: string; adapterVersion?: string }>;
+    };
+    const previousClaude = previous.collectors.find(
+      (collector) => collector.provider === "claude"
+    );
+    if (!previousClaude) throw new Error("Claude fixture health is missing.");
+    previousClaude.adapterVersion = "2.2.0";
+    await writeFile(snapshotPath, JSON.stringify(previous), "utf8");
+
+    const snapshot = await service.refresh({
+      rootDir,
+      collectors: {
+        claude: async () => ({
+          ...okResult("claude", [
+            { ...limit("claude"), id: "claude:new-limit" },
+          ]),
+          rawText: "new adapter layout",
+          cleanedText: "new adapter layout",
+        }),
+      },
+    });
+
+    expect(snapshot.collectors.find((item) => item.provider === "claude"))
+      .toMatchObject({
+        ok: false,
+        state: "stale",
+        attemptState: "drift",
+        formatChanged: true,
+        rowInventoryChanged: true,
+      });
+    expect(snapshot.limits).toEqual([
+      expect.objectContaining({
+        id: "claude:limit",
+        freshness: "stale",
+      }),
+    ]);
+    const report = JSON.parse(
+      await readFile(join(rootDir, "data", "compatibility-report.json"), "utf8")
+    ) as { passed: boolean };
+    expect(report.passed).toBe(false);
+  });
+
+  it("publishes only the exact row transition declared by an adapter migration", async () => {
+    const rootDir = await tempWorkspace(["claude"]);
+    const service = createRefreshService({
+      isRowInventoryMigrationApproved: (input) =>
+        input.provider === "claude" &&
+        input.fromAdapterVersion === "2.2.0" &&
+        input.toAdapterVersion === "2.7.0" &&
+        input.previousRowIds.join() === "claude:limit" &&
+        input.currentRowIds.join() === "claude:new-limit",
+    });
 
     await service.refresh({
       rootDir,
@@ -561,10 +622,6 @@ describe("refresh service", () => {
         freshness: "verified",
       }),
     ]);
-    const report = JSON.parse(
-      await readFile(join(rootDir, "data", "compatibility-report.json"), "utf8")
-    ) as { passed: boolean };
-    expect(report.passed).toBe(false);
   });
 
   it("does not consume an adapter upgrade when its first attempt fails", async () => {
@@ -631,7 +688,7 @@ describe("refresh service", () => {
       .toMatchObject({
         ok: true,
         state: "ok",
-        adapterVersion: "2.6.0",
+        adapterVersion: "2.7.0",
       });
   });
 

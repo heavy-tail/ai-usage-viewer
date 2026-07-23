@@ -24,7 +24,9 @@ import {
 } from "./storage";
 import { buildStaleStatusLabel } from "./lib/staleLabel";
 import {
+  isApprovedRowInventoryMigration,
   isConditionallyReportedLimit,
+  type RowInventoryMigrationInput,
   verifyCollectorResult,
 } from "./compatibility";
 import { buildCompatibilityReport } from "./compatibilityReport";
@@ -46,18 +48,39 @@ export type RefreshOptions = {
 export type RefreshService = {
   refresh: (options?: RefreshOptions) => Promise<UsageSnapshot>;
   isRunning: () => boolean;
+  lastError?: () => string | undefined;
 };
 
-export function createRefreshService(): RefreshService {
+export type RefreshServiceDependencies = {
+  isRowInventoryMigrationApproved?: (
+    input: RowInventoryMigrationInput
+  ) => boolean;
+};
+
+export function createRefreshService(
+  dependencies: RefreshServiceDependencies = {}
+): RefreshService {
   let inFlight: Promise<UsageSnapshot> | null = null;
+  let latestError: string | undefined;
+  const migrationApproved =
+    dependencies.isRowInventoryMigrationApproved ??
+    isApprovedRowInventoryMigration;
 
   return {
     isRunning: () => inFlight != null,
+    lastError: () => latestError,
     refresh: async (options = {}) => {
       if (inFlight) throw new RefreshInProgressError();
-      inFlight = runRefresh(options);
+      latestError = undefined;
+      inFlight = runRefresh(options, migrationApproved);
       try {
         return await inFlight;
+      } catch (error) {
+        if (!(error instanceof RefreshInProgressError)) {
+          latestError =
+            error instanceof Error ? error.message : "Usage refresh failed.";
+        }
+        throw error;
       } finally {
         inFlight = null;
       }
@@ -67,12 +90,15 @@ export function createRefreshService(): RefreshService {
 
 export const refreshService = createRefreshService();
 
-async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
+async function runRefresh(
+  options: RefreshOptions,
+  migrationApproved: (input: RowInventoryMigrationInput) => boolean
+): Promise<UsageSnapshot> {
   const rootDir = options.rootDir ?? process.cwd();
   const releaseLock = await tryAcquireRefreshLock(rootDir);
   if (!releaseLock) throw new RefreshInProgressError();
   try {
-    return await runLockedRefresh(options, rootDir);
+    return await runLockedRefresh(options, rootDir, migrationApproved);
   } finally {
     await releaseLock();
   }
@@ -80,7 +106,8 @@ async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
 
 async function runLockedRefresh(
   options: RefreshOptions,
-  rootDir: string
+  rootDir: string,
+  migrationApproved: (input: RowInventoryMigrationInput) => boolean
 ): Promise<UsageSnapshot> {
   const config = await loadConfig(rootDir);
   const previous = await readSnapshot(rootDir);
@@ -138,7 +165,8 @@ async function runLockedRefresh(
         result,
         previousRows,
         previousHealth,
-        enabled.has(provider)
+        enabled.has(provider),
+        migrationApproved
       );
       collectors.push(health);
       limits.push(...rowsFromResult(result, previousRows, health));
@@ -150,7 +178,13 @@ async function runLockedRefresh(
     // old rows so it disappears from the dashboard instead of looking current.
     if (!options.provider && !enabled.has(provider)) {
       collectors.push(
-        healthFromResult(disabledResult(provider), [], previousHealth, false)
+        healthFromResult(
+          disabledResult(provider),
+          [],
+          previousHealth,
+          false,
+          migrationApproved
+        )
       );
       continue;
     }
@@ -248,7 +282,8 @@ function healthFromResult(
   result: ProviderCollectorResult,
   previousRows: UsageLimit[],
   previous: CollectorHealth | undefined,
-  enabled: boolean
+  enabled: boolean,
+  migrationApproved: (input: RowInventoryMigrationInput) => boolean
 ): CollectorHealth {
   const hasPreviousRows = previousRows.length > 0;
   const previousRowIds = actionableRowIds(previousRows);
@@ -262,15 +297,26 @@ function healthFromResult(
     result.ok && previousRowIds.length > 0
       ? !sameStringArray(previousRowIds, currentRowIds)
       : undefined;
-  // A parser/layout update is intentional when the shipped adapter version
-  // changed. Publish the new code's validated rows locally, while retaining the
-  // change flags so the protected canary still requires explicit acceptance.
+  // A format-only parser update is intentional when the shipped adapter
+  // version changed. Actionable row additions/removals need a second, exact
+  // migration declaration; a version bump alone cannot authorize a subset.
   const adapterUpdated =
     result.ok &&
     previous !== undefined &&
     previous.adapterVersion !== result.adapterVersion;
+  const inventoryMigrationApproved =
+    rowInventoryChanged === true &&
+    adapterUpdated &&
+    migrationApproved({
+      provider: result.provider,
+      fromAdapterVersion: previous?.adapterVersion,
+      toAdapterVersion: result.adapterVersion,
+      previousRowIds,
+      currentRowIds,
+    });
   const compatibilityDrift =
-    (formatChanged || rowInventoryChanged === true) && !adapterUpdated;
+    (formatChanged && !adapterUpdated) ||
+    (rowInventoryChanged === true && !inventoryMigrationApproved);
   const attemptState = compatibilityDrift ? "drift" : result.state;
   const accepted = result.ok && !compatibilityDrift;
   const state: CollectorState =

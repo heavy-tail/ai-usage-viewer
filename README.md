@@ -98,21 +98,32 @@ npm run compatibility:check
 
 For provider-side changes that happen without a repository commit,
 `.github/workflows/compatibility-canary.yml` defines a separate six-hour canary
-on a dedicated, labeled self-hosted Windows runner. Once that runner is
-provisioned with non-personal provider test accounts, drift automatically opens
-or updates one GitHub issue and recovery closes it. Only the redacted report is
-uploaded; provider transcripts are never persisted, and runtime snapshots are
-removed from the runner workspace after each job. Personal OAuth sessions
-should never be copied into
-GitHub-hosted CI. The runner-owned baseline lives outside the checkout, and the
-`compatibility-canary` GitHub environment should require review before a manual
-baseline replacement can run. To intentionally accept a provider-format change,
-run the **Request compatibility baseline acceptance** workflow from `main`, then
-approve the protected `compatibility-canary` environment. The request workflow
-has no repository permissions and the credentialed canary is always loaded from
-the protected default branch. Scheduled comparisons remain read-only and never
-wait for approval; a missing or malformed baseline fails closed instead of being
-silently replaced.
+using two dedicated self-hosted Windows runner services:
+
+- `usage-viewer-canary` runs under a provider-test account. It may read the
+  canonical baseline directory but its Windows ACL must deny create, replace,
+  delete, and write access.
+- `usage-viewer-canary-writer` runs under a different Windows account with no
+  provider logins. It may replace the canonical baseline but never checks out or
+  executes repository/provider code.
+
+Both runner services point `USAGE_VIEWER_CANARY_BASELINE` at the same file
+outside their workspaces. The read-only runner should use the unprotected
+`compatibility-canary-readonly` environment. The writer uses
+`compatibility-canary`, which should require a reviewer and disallow
+self-review. Only the reader profile contains non-personal provider test
+sessions; personal OAuth sessions should never be copied to either runner or to
+GitHub-hosted CI.
+
+Scheduled runs compare against the baseline and upload only an allow-list
+redacted report. The independent GitHub-hosted watchdog manages the alert issue.
+To intentionally accept a provider-format change, run **Request compatibility
+baseline acceptance** from `main`, then approve the writer environment. The
+reader creates a structural candidate containing row IDs and format
+fingerprints—not accounts, quota values, resets, or provider text. The writer
+independently validates that candidate, confirms `main` has not advanced, and
+promotes it atomically. A missing/malformed baseline or an incorrect reader ACL
+fails closed.
 
 ## Desktop Shortcut
 
@@ -199,6 +210,10 @@ check before merge, and configure the `release` environment for protected
 branches with at least one required reviewer and self-review disabled. Those
 GitHub settings are part of the release trust boundary and should be audited
 after any repository-administration change.
+
+For the repeatable external Sol Pro review process used on this project, see
+[docs/sol-pro-review-workflow.md](docs/sol-pro-review-workflow.md). It is a
+review gate around CI, not a replacement for tests or branch protection.
 
 A separate GitHub-hosted watchdog checks the provider canary hourly. It opens a
 managed issue if the self-hosted canary is queued or running too long, fails, or

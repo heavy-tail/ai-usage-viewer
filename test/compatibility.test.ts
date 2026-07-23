@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   fingerprintFormat,
+  isApprovedRowInventoryMigration,
   validateLimits,
   verifyCollectorResult,
+  type RowInventoryMigration,
 } from "../src/compatibility";
 import type { ProviderCollectorResult } from "../src/collectors/types";
 import type { UsageLimit } from "../src/types";
@@ -14,7 +16,7 @@ describe("provider adapter contract", () => {
     expect(result).toMatchObject({
       ok: true,
       state: "ok",
-      adapterVersion: "2.6.0",
+      adapterVersion: "2.7.0",
     });
     expect(result.formatFingerprint).toMatch(/^[a-f0-9]{16}$/);
   });
@@ -133,6 +135,96 @@ describe("provider adapter contract", () => {
     expect(first).toBe(reordered);
     expect(changed).not.toBe(first);
   });
+
+  it("does not treat structured hard-stop values as a layout change", () => {
+    const first = verifyCollectorResult(
+      providerSuccess("codex", [
+        providerLimit(
+          "codex",
+          JSON.stringify({
+            limitId: "codex",
+            limitName: null,
+            usedPercent: 10,
+            rateLimitReachedType: null,
+            spendControlReached: null,
+          })
+        ),
+      ])
+    );
+    const second = verifyCollectorResult(
+      providerSuccess("codex", [
+        providerLimit(
+          "codex",
+          JSON.stringify({
+            limitId: "codex",
+            limitName: "GPT-5",
+            usedPercent: 90,
+            rateLimitReachedType: "workspace_member_usage_limit_reached",
+            spendControlReached: true,
+          })
+        ),
+      ])
+    );
+
+    expect(first.formatFingerprint).toBe(second.formatFingerprint);
+  });
+
+  it("still fingerprints a new structured contract field", () => {
+    const before = providerSuccess("codex", [
+      providerLimit("codex", '{"limitId":"codex","usedPercent":10}'),
+    ]);
+    const after = providerSuccess("codex", [
+      providerLimit(
+        "codex",
+        '{"limitId":"codex","usedPercent":90,"newQuotaMode":true}'
+      ),
+    ]);
+
+    expect(verifyCollectorResult(before).formatFingerprint).not.toBe(
+      verifyCollectorResult(after).formatFingerprint
+    );
+  });
+
+  it("normalizes changing Grok reset dates and Pacific abbreviations", () => {
+    expect(
+      fingerprintFormat("Usage: 10% · Next reset: July 31, 16:00 PST")
+    ).toBe(
+      fingerprintFormat("Usage: 90% · Next reset: August 30, 09:15 PDT")
+    );
+  });
+
+  it("approves only an exact declared row-inventory migration", () => {
+    const migrations: readonly RowInventoryMigration[] = [
+      {
+        provider: "grok",
+        fromAdapterVersion: "2.3.0",
+        toAdapterVersion: "2.4.0",
+        addedRowIds: ["grok:usage"],
+        removedRowIds: ["grok:weekly"],
+      },
+    ];
+    const input = {
+      provider: "grok" as const,
+      fromAdapterVersion: "2.3.0",
+      toAdapterVersion: "2.4.0",
+      previousRowIds: ["grok:weekly"],
+      currentRowIds: ["grok:usage"],
+    };
+
+    expect(isApprovedRowInventoryMigration(input, migrations)).toBe(true);
+    expect(
+      isApprovedRowInventoryMigration(
+        { ...input, currentRowIds: ["grok:usage", "grok:unknown"] },
+        migrations
+      )
+    ).toBe(false);
+    expect(
+      isApprovedRowInventoryMigration(
+        { ...input, toAdapterVersion: "2.5.0" },
+        migrations
+      )
+    ).toBe(false);
+  });
 });
 
 function success(limits: UsageLimit[]): ProviderCollectorResult {
@@ -160,6 +252,42 @@ function limit(): UsageLimit {
     status: "available",
     sourceCommand: "fixture",
     sourceText: "Current session 10% used",
+    checkedAt: "2026-07-18T00:00:00.000Z",
+  };
+}
+
+function providerSuccess(
+  provider: "codex",
+  limits: UsageLimit[]
+): ProviderCollectorResult {
+  return {
+    provider,
+    ok: true,
+    state: "ok",
+    checkedAt: "2026-07-18T00:00:00.000Z",
+    durationMs: 12,
+    limits,
+    rawText: limits.map((row) => row.sourceText).join("\n"),
+    cleanedText: limits.map((row) => row.sourceText).join("\n"),
+    rawFileName: `${provider}.txt`,
+  };
+}
+
+function providerLimit(
+  provider: "codex",
+  sourceText: string
+): UsageLimit {
+  return {
+    id: `${provider}:weekly`,
+    provider,
+    providerLabel: "Codex",
+    scope: "Weekly limit",
+    window: "weekly",
+    usedPercent: 10,
+    remainingPercent: 90,
+    status: "available",
+    sourceCommand: "fixture",
+    sourceText,
     checkedAt: "2026-07-18T00:00:00.000Z",
   };
 }

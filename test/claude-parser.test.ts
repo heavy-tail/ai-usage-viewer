@@ -177,6 +177,24 @@ describe("Claude usage compatibility", () => {
     expect(() => parseClaudeUsage(text, meta)).toThrow(ParserDriftError);
   });
 
+  it("ignores local-session contribution percentages inside their named panel", () => {
+    const text = usageText([
+      "What's contributing to your limits usage?",
+      "Local session A",
+      "12% used",
+      "Local session B · 8% used",
+      "Usage credits",
+      "Usage credits are off",
+    ]);
+
+    const limits = parseClaudeUsage(text, meta);
+
+    expect(limits.map((limit) => limit.id)).toEqual([
+      "claude:session",
+      "claude:week-all",
+    ]);
+  });
+
   it("accepts disabled usage credits and keeps the latest live redraw", () => {
     const first = usageText([]).replace("3% used", "9% used");
     const second = usageText([

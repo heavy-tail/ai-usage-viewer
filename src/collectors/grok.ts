@@ -44,14 +44,19 @@ export async function collectGrok(
         // Quota warnings are conditional and may be weekly or monthly. The
         // prompt marker is the stable signal that the current public Grok Build
         // TUI is ready to accept a slash command, regardless of usage level.
-        { waitFor: /(?:│|\|)\s*>\s*/, timeoutMs: 15_000 },
+        {
+          waitFor:
+            /(?:(?:│|\|)\s*>|(?:^|[\r\n])\s*>)\s*(?:Type a message\.\.\.)?/m,
+          timeoutMs: 15_000,
+        },
         { delayMs: 300 },
         // Submit the complete slash command directly. Driving the completion
         // menu introduced rotating suggestion/status redraws into ConPTY and
         // occasionally selected no action at all, making refresh flaky.
         { send: "/usage show\r", delayMs: 300 },
         {
-          waitFor: /(?:Monthly|Weekly|Usage) limit:\s*\d/i,
+          waitFor:
+            /(?:(?:(?:Monthly|Weekly) limit|Usage):\s*\d|Login with Grok|error sending request[^\r\n]*auth\.x\.ai)/i,
           timeoutMs: 12_000,
         },
         { delayMs: 300 },
@@ -62,6 +67,17 @@ export async function collectGrok(
     if (/command not found|not found|No such file/i.test(pty.cleanedOutput)) {
       throw new CollectorUnavailableError(
         "Grok CLI is not available.",
+        pty.rawOutput,
+        pty.cleanedOutput
+      );
+    }
+    if (
+      /Login with Grok|error sending request[^\r\n]*auth\.x\.ai/i.test(
+        pty.cleanedOutput
+      )
+    ) {
+      throw new CollectorUnavailableError(
+        "Grok CLI could not authenticate with xAI.",
         pty.rawOutput,
         pty.cleanedOutput
       );

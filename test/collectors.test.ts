@@ -153,6 +153,15 @@ describe("Collectors with mocked provider output", () => {
       expect(options.steps[2]?.send).toBe("/usage show\r");
       expect((options.steps[0]?.waitFor as RegExp).test("│ > "))
         .toBe(true);
+      expect((options.steps[0]?.waitFor as RegExp).test("\n> \n"))
+        .toBe(true);
+      expect(
+        (options.steps[0]?.waitFor as RegExp).test(
+          "╮│ > Type a message...X│╰"
+        )
+      ).toBe(true);
+      expect((options.steps[3]?.waitFor as RegExp).test("Usage: 42%"))
+        .toBe(true);
       return {
         rawOutput: "Weekly limit: 83%\nMonthly limit: 30%",
         cleanedOutput: "Weekly limit: 83%\nMonthly limit: 30%",
@@ -179,6 +188,27 @@ describe("Collectors with mocked provider output", () => {
     expect(result.state).toBe("error");
     expect(result.limits).toEqual([]);
     expect(result.error).toBe("detail timed out");
+  });
+
+  it("reports the current Grok login screen as unavailable without publishing rows", async () => {
+    const loginScreen = [
+      "error sending request for url (https://auth.x.ai/.well-known/openid-configuration)",
+      "Login with Grok",
+      "│ > Type a message...",
+    ].join("\n");
+    const ptyRunner = vi.fn(async () => ({
+      rawOutput: loginScreen,
+      cleanedOutput: loginScreen,
+    })) as unknown as PtyRunner;
+
+    const result = await collectGrok(context({ ptyRunner }));
+
+    expect(result).toMatchObject({
+      ok: false,
+      state: "unavailable",
+      limits: [],
+      error: "Grok CLI could not authenticate with xAI.",
+    });
   });
 });
 
