@@ -1,14 +1,29 @@
 {
   "name": "usage-viewer",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
+    "build:agy-job-host": "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/build-agy-job-host.ps1",
+    "predev": "npm run build:agy-job-host",
     "dev": "vite",
+    "preapi": "npm run build:agy-job-host",
     "api": "tsx src/server.ts",
+    "prestart": "npm run build:agy-job-host",
+    "start": "tsx src/server.ts",
+    "precollect": "npm run build:agy-job-host",
     "collect": "tsx src/collect.ts",
+    "precompatibility:check": "npm run build:agy-job-host",
+    "compatibility:check": "tsx src/checkCompatibility.ts",
+    "compatibility:baseline:create": "tsx src/createCompatibilityBaseline.ts",
+    "compatibility:baseline:validate": "tsx src/validateCompatibilityBaseline.ts",
+    "pretest": "npm run build:agy-job-host",
     "test": "vitest run",
     "typecheck": "tsc -b",
+    "prebuild": "npm run build:agy-job-host",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -21,13 +36,13 @@
     "strip-ansi": "^7.2.0"
   },
   "devDependencies": {
-    "@types/node": "^25.9.1",
+    "@types/node": "^24.13.3",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.4",
+    "@vitejs/plugin-react": "^6.0.3",
     "tsx": "^4.22.4",
     "typescript": "^5.6.3",
-    "vite": "^5.4.11",
+    "vite": "^8.1.5",
     "vitest": "^4.1.8"
   }
 }

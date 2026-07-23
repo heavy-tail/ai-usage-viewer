@@ -18,6 +18,7 @@ export function ProviderCard({
   queued,
   refreshDisabled,
   onRefresh,
+  timeZone,
 }: {
   provider: UsageProvider;
   limits: UsageLimit[];
@@ -27,6 +28,7 @@ export function ProviderCard({
   queued?: boolean;
   refreshDisabled?: boolean;
   onRefresh?: () => void;
+  timeZone?: string;
 }) {
   const statusMessage = displayHealthMessage(health, limits.length > 0);
   const refreshLabel = refreshing ? "Refreshing…" : queued ? "Queued" : "Refresh";
@@ -56,28 +58,39 @@ export function ProviderCard({
         )}
       </header>
 
-      {statusMessage && <div className="card-error">{statusMessage}</div>}
+      {statusMessage && <div className="card-status">{statusMessage}</div>}
 
       <div className="card-body">
         {limits.length === 0 ? (
-          <div className="empty">No rows.</div>
+          <div className="empty">No verified usage available.</div>
         ) : (
-          limits.map((l) => <UsageRow key={l.id} limit={l} />)
+          limits.map((l) => (
+            <UsageRow key={l.id} limit={l} timeZone={timeZone} />
+          ))
         )}
       </div>
     </section>
   );
 }
 
-function displayHealthMessage(
+export function displayHealthMessage(
   health: CollectorHealth | undefined,
   hasRows: boolean
 ): string | undefined {
   if (!health || health.ok) return undefined;
-  if (!hasRows) return undefined;
-  if (health.state === "stale") return undefined;
-  if (health.state === "drift") return "CLI output changed; usage parsing needs an update.";
-  if (health.state === "error") return "Refresh failed; showing available saved data.";
+  if (health.state === "stale") {
+    return hasRows
+      ? "Latest refresh failed; showing last verified values."
+      : "Usage is temporarily unavailable.";
+  }
+  if (health.state === "drift") {
+    return "Usage format changed; waiting for a verified update.";
+  }
+  if (health.state === "error") {
+    return hasRows
+      ? "Latest refresh failed; showing last verified values."
+      : "Usage is temporarily unavailable.";
+  }
   if (health.state === "unavailable") return "CLI is currently unavailable.";
   return undefined;
 }

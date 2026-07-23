@@ -29,12 +29,21 @@ export type UsageLimit = {
   remainingPercent?: number;
   resetLabel?: string;
 
-  // MVP displays resetLabel only; resetAt stays unset until timezone/year
-  // inference is implemented (Appendix A.2.3).
+  // Canonical timestamp when the provider supplies one. The UI can safely
+  // infer older, unambiguous resetLabel shapes for consistent presentation.
   resetAt?: string;
 
   status: UsageStatus;
   statusLabel?: string;
+
+  // A provider can explicitly block usage even when the percentage gauge is
+  // still low (for example, a workspace spending limit). Keep that state
+  // separate from provider-specific labels so the UI cannot hide it.
+  blockingReason?: string;
+
+  // Rows retained after a failed refresh remain useful, but must never look
+  // like newly verified data.
+  freshness?: "verified" | "stale";
 
   // Context-style rows shown as secondary metadata, not a colored quota bar.
   informational?: boolean;
@@ -54,15 +63,32 @@ export type CollectorState =
 
 export type CollectorHealth = {
   provider: UsageProvider;
+  // Explicitly distinguishes configured providers from placeholders and
+  // disabled collectors, including when the collector has no rows yet.
+  enabled?: boolean;
   ok: boolean;
   state: CollectorState;
+  // The displayed rows may be stale. Preserve the latest attempt's cause for
+  // compatibility automation without exposing it in the primary UI.
+  attemptState?: Exclude<CollectorState, "stale">;
   checkedAt: string;
   durationMs: number;
+  // Compatibility diagnostics stay out of the primary UI, but make canary and
+  // repair reports traceable to an exact adapter and observed output shape.
+  adapterVersion?: string;
+  formatFingerprint?: string;
+  formatChanged?: boolean;
+  // True when a previously observed actionable quota row disappears or a new
+  // one appears. This catches partial parser success that a format hash alone
+  // cannot reliably identify.
+  rowInventoryChanged?: boolean;
   error?: string;
 };
 
 export type UsageSnapshot = {
   generatedAt: string;
+  // The validated display timezone used for every provider reset time.
+  timezone?: string;
   collectors: CollectorHealth[];
   limits: UsageLimit[];
 };
@@ -79,7 +105,7 @@ export type AppConfig = {
     // Empty means show every group.
     pinnedGroups: string[];
   };
-  // Reserved — accepted in config but not yet consumed by any collector/UI.
+  // IANA timezone used consistently for every reset timestamp in the UI.
   timezone: string;
   // Command used to launch the native Grok CLI. Defaults to "grok" (on PATH);
   // set an absolute path in config.json when it is not on PATH.

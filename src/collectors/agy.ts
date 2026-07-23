@@ -1,11 +1,22 @@
-import { parseAgyAccountInfo, parseAgyQuota } from "../parsers/agy";
+import { isAbsolute, relative, resolve } from "node:path";
+import { parseAgyRpcQuota } from "../parsers/agyRpc";
+import { localSourceTimeZone } from "../parsers/common";
 import { CollectorUnavailableError } from "./errors";
-import { isCommandAvailable } from "./command";
+import { resolveCommandPath } from "./command";
+import {
+  AgyRpcError,
+  readAgyQuotaRpc,
+  type AgyRpcOptions,
+  type AgyRpcResult,
+} from "./agyRpc";
 import { failedResult, okResult } from "./helpers";
 import type { CollectorContext, ProviderCollectorResult } from "./types";
 
 export async function collectAgy(
-  context: CollectorContext
+  context: CollectorContext,
+  dependencies: {
+    rpcReader?: typeof readAgyQuotaRpc;
+  } = {}
 ): Promise<ProviderCollectorResult> {
   const provider = "agy" as const;
   const startedAt = Date.now();
@@ -13,57 +24,87 @@ export async function collectAgy(
   const rawFileName = "agy.txt";
 
   try {
-    if (!(await isCommandAvailable("agy", context.rootDir, context.commandRunner))) {
+    const command = await resolveCommandPath(
+      "agy",
+      context.rootDir,
+      context.commandRunner
+    );
+    if (!command) {
       throw new CollectorUnavailableError("Antigravity CLI (agy) is not installed.");
     }
+    if (!isAbsolute(command) || isWithinDirectory(command, context.rootDir)) {
+      throw new CollectorUnavailableError(
+        "Antigravity CLI (agy) did not resolve to a trusted installed executable."
+      );
+    }
 
-    const pty = await context.ptyRunner({
-      command: "agy",
-      args: [],
+    // AGY's TUI creates a Windows console before hiding it, which can still be
+    // presented for a frame. Its own local language service exposes the same
+    // quota as structured Connect JSON, so collect that data without creating a
+    // PTY or scraping a provider-owned screen. If this private contract changes,
+    // fail closed and retain the last verified rows instead of falling back to a
+    // terminal that can flash or silently publish an incomplete layout.
+    const rpc = await readQuotaWithStartupRetry(
+      dependencies.rpcReader ?? readAgyQuotaRpc,
+      {
+      command,
       cwd: context.rootDir,
-      cols: 160,
-      rows: 60,
-      // agy signs in over the network at launch ("Signing in…") before it can
-      // draw the quota screen; that step is variable and occasionally exceeds
-      // 30s, which previously tripped the total cap and marked agy stale. Give
-      // the slow-login case headroom (the success path still finishes in ~6-9s).
-      totalTimeoutMs: 45_000,
-      responders: [{ when: /trust|workspace/i, send: "y\r", once: true }],
-      steps: [
-        { waitFor: /\? for shortcuts|Google AI Pro|>\s*$/i, timeoutMs: 15_000 },
-        { send: "/quota\r", delayMs: 250 },
-        // Wait for the actual quota screen ("Weekly Limit" only renders there),
-        // not the "/usage (quota)" autocomplete menu. Then let all groups draw.
-        { waitFor: /Weekly Limit/i, timeoutMs: 40_000 },
-        { delayMs: 1_000 },
-        { send: "\x1b", delayMs: 100 },
-        { send: "/exit\r", delayMs: 100 },
-      ],
-    });
-
-    const account = parseAgyAccountInfo(pty.cleanedOutput);
+      }
+    );
     const meta = {
       checkedAt,
-      sourceCommand: "agy -> /quota",
-      planLabel:
-        account.planLabel ?? context.config.planLabelFallback.agy ?? undefined,
-      accountLabel: account.email,
+      sourceCommand: "agy local quota API",
+      sourceTimeZone: localSourceTimeZone(),
+      planLabel: context.config.planLabelFallback.agy ?? undefined,
     };
+    const parsed = parseAgyRpcQuota(
+      rpc.payload,
+      meta,
+      context.config.agy.pinnedGroups
+    );
 
     return okResult({
       provider,
       startedAt,
       checkedAt,
-      limits: parseAgyQuota(
-        pty.cleanedOutput,
-        meta,
-        context.config.agy.pinnedGroups
-      ),
-      rawText: pty.rawOutput,
-      cleanedText: pty.cleanedOutput,
+      limits: parsed.limits,
+      // Never persist AGY's complete internal response. The parser emits only
+      // the normalized quota structure needed for diagnostics/fingerprinting.
+      rawText: parsed.sourceText,
+      cleanedText: parsed.sourceText,
       rawFileName,
     });
   } catch (error) {
     return failedResult({ provider, startedAt, checkedAt, rawFileName, error });
   }
+}
+
+async function readQuotaWithStartupRetry(
+  reader: (options?: AgyRpcOptions) => Promise<AgyRpcResult>,
+  options: Pick<AgyRpcOptions, "command" | "cwd">
+): Promise<AgyRpcResult> {
+  try {
+    // Healthy launches announce the loopback service in a few seconds. A
+    // shorter first deadline lets us recover from AGY's occasional hung cold
+    // start without making the user wait through the entire refresh budget.
+    return await reader({ ...options, timeoutMs: 15_000 });
+  } catch (error) {
+    if (!(error instanceof AgyRpcError) || error.code !== "timeout") {
+      throw error;
+    }
+  }
+
+  // The first attempt has already been fully cleaned up by readAgyQuotaRpc.
+  // One fresh, independently contained launch remains bounded by the original
+  // 45-second aggregate budget and succeeds on current AGY builds after a
+  // transient cold-start hang.
+  return reader({ ...options, timeoutMs: 30_000 });
+}
+
+function isWithinDirectory(path: string, directory: string): boolean {
+  const difference = relative(resolve(directory), resolve(path));
+  return (
+    difference === "" ||
+    (!difference.startsWith("..") && !isAbsolute(difference))
+  );
 }

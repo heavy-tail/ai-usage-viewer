@@ -258,15 +258,15 @@
     <div class="pillrow">
       <span class="pill"><span class="dot" style="background:var(--st-green)"></span>Runs 100% on localhost</span>
       <span class="pill"><span class="dot" style="background:var(--accent-2)"></span>TypeScript end-to-end</span>
-      <span class="pill"><span class="dot" style="background:var(--st-amber)"></span>No vendor APIs — reads the CLIs</span>
+      <span class="pill"><span class="dot" style="background:var(--st-amber)"></span>Structured CLI interfaces first, isolated PTYs as fallback</span>
       <span class="pill"><span class="dot" style="background:var(--st-purple)"></span>Secrets redacted before storage</span>
     </div>
 
     <div class="stats">
       <div class="stat"><div class="n">4</div><div class="l">providers unified</div></div>
       <div class="stat"><div class="n">~2.0k</div><div class="l">lines of source</div></div>
-      <div class="stat"><div class="n">40</div><div class="l">passing tests</div></div>
-      <div class="stat"><div class="n">3</div><div class="l">runnable processes</div></div>
+      <div class="stat"><div class="n">90+</div><div class="l">automated checks</div></div>
+      <div class="stat"><div class="n">1</div><div class="l">production process</div></div>
     </div>
   </header>
 
@@ -280,21 +280,21 @@
       "how much do I have left everywhere?" view. This app is that view.
     </p>
     <p>
-      The catch — and the defining design constraint — is that none of these tools expose a usage
-      <i>API</i>. So instead of calling an endpoint, the app <b>launches each CLI in a real
-      terminal, types the usage command for you, reads the screen, and extracts the numbers</b>.
-      Everything below follows from that one decision.
+      The defining design constraint is that provider capabilities differ: Codex exposes structured
+      rate limits through app-server, while other tools still expose quota through interactive UI.
+      The app <b>uses a structured local interface when available and otherwise launches an isolated
+      terminal session, drives the usage screen, and validates every extracted section</b>.
     </p>
 
     <div class="grid-4" style="margin-top:18px">
       <div class="card prov" style="--pc:var(--p-claude)">
-        <div class="ph"><div class="mk">C</div><div><div class="pn">Claude Code</div><div class="pp">claude → /usage</div></div></div>
-        <ul><li>Session + weekly limits</li><li>All-models &amp; Sonnet-only</li></ul>
+        <div class="ph"><div class="mk">C</div><div><div class="pn">Claude Code</div><div class="pp">screen-reader mode → /usage</div></div></div>
+        <ul><li>Session + weekly limits</li><li>Model buckets &amp; usage credits</li></ul>
         <div class="ubar"><div class="ufill" style="--w:18%;--tone:var(--st-green)"></div></div>
       </div>
       <div class="card prov" style="--pc:var(--p-codex)">
-        <div class="ph"><div class="mk">Cx</div><div><div class="pn">Codex</div><div class="pp">codex → /status</div></div></div>
-        <ul><li>5h + weekly windows</li><li>Context-left (info row)</li></ul>
+        <div class="ph"><div class="mk">Cx</div><div><div class="pn">Codex</div><div class="pp">app-server → account/rateLimits/read</div></div></div>
+        <ul><li>Structured quota buckets</li><li>TUI fallback for older builds</li></ul>
         <div class="ubar"><div class="ufill" style="--w:62%;--tone:var(--st-amber)"></div></div>
       </div>
       <div class="card prov" style="--pc:var(--p-agy)">
@@ -303,8 +303,8 @@
         <div class="ubar"><div class="ufill" style="--w:44%;--tone:var(--st-green)"></div></div>
       </div>
       <div class="card prov" style="--pc:var(--p-grok)">
-        <div class="ph"><div class="mk" style="color:#0b0e14">G</div><div><div class="pn">Grok</div><div class="pp">wsl → grok → /usage</div></div></div>
-        <ul><li>Free-credit usage</li><li>Runs through WSL</li></ul>
+        <div class="ph"><div class="mk" style="color:#0b0e14">G</div><div><div class="pn">Grok</div><div class="pp">native grok → /usage show</div></div></div>
+        <ul><li>Weekly usage + legacy monthly detail</li><li>Native Windows CLI</li></ul>
         <div class="ubar"><div class="ufill" style="--w:93%;--tone:var(--st-red)"></div></div>
       </div>
     </div>
@@ -330,11 +330,13 @@
       <div class="step"><div class="ic">🛡️</div><div class="t">Redact</div><div class="d">emails/ids</div></div>
     </div>
     <div class="note">
-      <b>Why "drift" is a first-class concept.</b> Terminal output is not a contract. When a vendor
-      changes their CLI's wording, the regex stops matching — so the parser throws a
+      <b>Why "drift" is a first-class concept.</b> Provider output can evolve. When a vendor
+      changes its UI or structured schema, completeness checks fail closed — so the adapter throws a
       <code>ParserDriftError</code> and the provider is marked <span class="mono">drift</span>
-      instead of crashing. The app keeps showing your last-known numbers and flags that parsing
-      needs an update. This is the single biggest source of long-term maintenance.
+      instead of publishing partial data. The app quietly keeps showing the last verified numbers
+      while a redacted compatibility report records the change for the local monitor, an optional
+      credential-isolated scheduled canary, or a separate repair worker.
+      Autonomous code repair is not bundled in this repository.
     </div>
   </section>
 
@@ -388,7 +390,7 @@
     </div>
     <div class="arrowdown" style="color:var(--text-faint)">▼ &nbsp; spawns &nbsp; ▼</div>
     <div class="layer" style="background:var(--panel-2)">
-      <div class="lh"><span class="chip">EXTERNAL</span><h3>The real CLIs on your machine</h3><span class="side">claude · codex · agy · wsl→grok</span></div>
+      <div class="lh"><span class="chip">EXTERNAL</span><h3>The real CLIs on your machine</h3><span class="side">claude · codex app-server · agy · grok</span></div>
     </div>
   </section>
 
@@ -399,9 +401,9 @@
     <div class="card">
       <ol style="margin:0; padding-left:22px; color:var(--text-dim); line-height:1.9">
         <li>You click <b>Refresh</b> → <code>POST /api/refresh</code> hits the local server.</li>
-        <li><code>refreshService</code> takes an in-flight lock (a second refresh gets <span class="mono">409</span>) and reads the previous snapshot.</li>
-        <li>For each <b>enabled</b> provider in order, the collector checks the CLI is installed &amp; logged in, then drives it through the PTY conversation.</li>
-        <li>Raw terminal output is cleaned (ANSI/control codes stripped, duplicate redraw lines collapsed).</li>
+        <li><code>refreshService</code> takes process and OS-owned named-pipe locks (a second refresh gets <span class="mono">409</span>) and reads the previous snapshot.</li>
+        <li>Enabled providers collect concurrently, using Codex app-server where possible and isolated PTY conversations elsewhere.</li>
+        <li>Captured provider output is normalized; terminal output also has ANSI/control codes removed.</li>
         <li>A provider-specific parser regex-extracts the percentages → <code>limitFromUsed / limitFromRemaining</code> build a normalized <code>UsageLimit</code>, with a status derived from the numbers.</li>
         <li>Results are <b>merged</b> with the previous snapshot: failed providers keep their last numbers but get flagged <span class="mono">stale</span>; healthy ones replace.</li>
         <li>The whole snapshot is run through <b>redaction</b> (emails, org/account/session IDs) and written to <code>data/usage-snapshot.json</code>.</li>
@@ -477,7 +479,7 @@
     ├─ <span class="f">usage.ts</span> <span class="c"># labels, ordering, formatting</span>
     └─ <span class="f">snapshotView.ts</span> <span class="c"># which providers to show</span>
     </div>
-    <p class="faint" style="font-size:12.5px"><code>test/</code> mirrors this with 40 tests across parsers, collectors, the refresh merge logic, and snapshot visibility.</p>
+    <p class="faint" style="font-size:12.5px"><code>test/</code> mirrors this with 100+ checks across parsers, collectors, compatibility contracts, refresh locking, delivery, and snapshot visibility.</p>
   </section>
 
   <!-- DATA MODEL -->
@@ -526,6 +528,7 @@
       <div class="card"><h3>🔒 Local-only by design</h3><p style="margin:0">Both the API and Vite dev server bind to <code>127.0.0.1</code>, and <code>data/</code> is git-ignored. Your usage never leaves the machine.</p></div>
       <div class="card"><h3>♻️ Degrade, don't disappear</h3><p style="margin:0">A failed refresh keeps the last good numbers, marks them <span class="mono">stale</span>, and still grades the bar by saved percentage — the dashboard is useful even when a CLI is down.</p></div>
       <div class="card"><h3>🚦 One refresh at a time</h3><p style="margin:0">An in-flight lock serializes refreshes; the UI queues per-provider requests and polls until the run clears, so concurrent clicks can't stampede the CLIs.</p></div>
+      <div class="card"><h3>✅ Verify before delivery</h3><p style="margin:0">Pull requests run parser fixtures, contracts, type checks, an audit, and a production build. A dedicated Windows canary can detect vendor-only drift; tagged bundles are smoke-tested, checksummed, attested, and never silently replaced.</p></div>
     </div>
   </section>
 
@@ -550,16 +553,16 @@
           <tr><th>Package</th><th>Role</th></tr>
           <tr><td><span class="mono">typescript</span></td><td class="role">end-to-end types</td></tr>
           <tr><td><span class="mono">vite</span> + <span class="mono">@vitejs/plugin-react</span></td><td class="role">dev server &amp; bundler</td></tr>
-          <tr><td><span class="mono">vitest</span></td><td class="role">unit tests (40 passing)</td></tr>
+          <tr><td><span class="mono">vitest</span></td><td class="role">adapter contracts, fixtures &amp; integration tests</td></tr>
           <tr><td><span class="mono">tsx</span></td><td class="role">run TS server/collector directly</td></tr>
         </table>
       </div>
     </div>
 
-    <h3 style="margin-top:22px">The four commands</h3>
+    <h3 style="margin-top:22px">Core commands</h3>
     <div class="grid-4">
       <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm run dev</div><p class="faint" style="font-size:12px;margin:8px 0 0">Vite UI on :5173, proxies /api</p></div>
-      <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm run api</div><p class="faint" style="font-size:12px;margin:8px 0 0">collector API on :4317</p></div>
+      <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm start</div><p class="faint" style="font-size:12px;margin:8px 0 0">production UI + API on :4317</p></div>
       <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm run collect</div><p class="faint" style="font-size:12px;margin:8px 0 0">headless refresh → JSON</p></div>
       <div class="card" style="padding:16px"><div class="mono" style="color:var(--st-green)">npm test</div><p class="faint" style="font-size:12px;margin:8px 0 0">run the vitest suite</p></div>
     </div>

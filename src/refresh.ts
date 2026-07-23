@@ -5,7 +5,7 @@ import type {
   UsageProvider,
   UsageSnapshot,
 } from "./types";
-import { PROVIDER_ORDER, deriveStatus } from "./lib/usage";
+import { PROVIDER_ORDER } from "./lib/usage";
 import { loadConfig } from "./config";
 import { PROVIDER_COLLECTORS } from "./collectors";
 import { runPty } from "./collectors/pty";
@@ -17,11 +17,20 @@ import type {
 } from "./collectors/types";
 import {
   rawFileNameForProvider,
+  purgeRawOutputs,
   readSnapshot,
-  writeRawOutput,
+  writeCompatibilityReport,
   writeSnapshot,
 } from "./storage";
 import { buildStaleStatusLabel } from "./lib/staleLabel";
+import {
+  isApprovedRowInventoryMigration,
+  isConditionallyReportedLimit,
+  type RowInventoryMigrationInput,
+  verifyCollectorResult,
+} from "./compatibility";
+import { buildCompatibilityReport } from "./compatibilityReport";
+import { tryAcquireRefreshLock } from "./refreshLock";
 
 export class RefreshInProgressError extends Error {
   constructor() {
@@ -39,18 +48,39 @@ export type RefreshOptions = {
 export type RefreshService = {
   refresh: (options?: RefreshOptions) => Promise<UsageSnapshot>;
   isRunning: () => boolean;
+  lastError?: () => string | undefined;
 };
 
-export function createRefreshService(): RefreshService {
+export type RefreshServiceDependencies = {
+  isRowInventoryMigrationApproved?: (
+    input: RowInventoryMigrationInput
+  ) => boolean;
+};
+
+export function createRefreshService(
+  dependencies: RefreshServiceDependencies = {}
+): RefreshService {
   let inFlight: Promise<UsageSnapshot> | null = null;
+  let latestError: string | undefined;
+  const migrationApproved =
+    dependencies.isRowInventoryMigrationApproved ??
+    isApprovedRowInventoryMigration;
 
   return {
     isRunning: () => inFlight != null,
+    lastError: () => latestError,
     refresh: async (options = {}) => {
       if (inFlight) throw new RefreshInProgressError();
-      inFlight = runRefresh(options);
+      latestError = undefined;
+      inFlight = runRefresh(options, migrationApproved);
       try {
         return await inFlight;
+      } catch (error) {
+        if (!(error instanceof RefreshInProgressError)) {
+          latestError =
+            error instanceof Error ? error.message : "Usage refresh failed.";
+        }
+        throw error;
       } finally {
         inFlight = null;
       }
@@ -60,10 +90,31 @@ export function createRefreshService(): RefreshService {
 
 export const refreshService = createRefreshService();
 
-async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
+async function runRefresh(
+  options: RefreshOptions,
+  migrationApproved: (input: RowInventoryMigrationInput) => boolean
+): Promise<UsageSnapshot> {
   const rootDir = options.rootDir ?? process.cwd();
+  const releaseLock = await tryAcquireRefreshLock(rootDir);
+  if (!releaseLock) throw new RefreshInProgressError();
+  try {
+    return await runLockedRefresh(options, rootDir, migrationApproved);
+  } finally {
+    await releaseLock();
+  }
+}
+
+async function runLockedRefresh(
+  options: RefreshOptions,
+  rootDir: string,
+  migrationApproved: (input: RowInventoryMigrationInput) => boolean
+): Promise<UsageSnapshot> {
   const config = await loadConfig(rootDir);
   const previous = await readSnapshot(rootDir);
+  // Older builds persisted broad CLI transcripts for diagnostics. Remove them
+  // before collecting and keep all new compatibility evidence in memory or in
+  // the narrowly redacted compatibility report.
+  await purgeRawOutputs(rootDir);
   const enabled = new Set(config.enabledProviders);
   const providersToRun = options.provider
     ? [options.provider]
@@ -76,24 +127,26 @@ async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
     commandRunner: runCommand,
   };
 
-  // Collectors are independent (each drives its own CLI / PTY), so run them
-  // concurrently: total refresh time then tracks the slowest provider instead of
-  // the sum of all four. Each provider still fails in isolation
-  // (runProviderCollector never throws), and health/rows are merged below in
-  // deterministic PROVIDER_ORDER, so output ordering is unaffected.
-  const collected = await Promise.all(
-    providersToRun.map(async (provider) => {
-      const result = enabled.has(provider)
-        ? await runProviderCollector(provider, collectorMap[provider], context)
-        : disabledResult(provider);
-      await writeRawOutput(
-        rootDir,
-        result.rawFileName,
-        result.cleanedText || result.error || "No collector output captured."
-      );
-      return [provider, result] as const;
-    })
+  const collectProvider = async (provider: UsageProvider) => {
+    const result = enabled.has(provider)
+      ? await runProviderCollector(provider, collectorMap[provider], context)
+      : disabledResult(provider);
+    return [provider, result] as const;
+  };
+
+  // AGY's local language service is sensitive to simultaneous cold starts of
+  // the three terminal-based CLIs on Windows. Start its structured RPC service
+  // first, then keep Claude/Codex/Grok concurrent. This adds only AGY's normal
+  // few-second startup while avoiding a 45-second false timeout and stale row.
+  const agyResult = providersToRun.includes("agy")
+    ? [await collectProvider("agy")]
+    : [];
+  const otherResults = await Promise.all(
+    providersToRun
+      .filter((provider) => provider !== "agy")
+      .map(collectProvider)
   );
+  const collected = [...agyResult, ...otherResults];
   const results = new Map<UsageProvider, ProviderCollectorResult>(collected);
 
   const collectors: CollectorHealth[] = [];
@@ -108,8 +161,15 @@ async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
     );
 
     if (result) {
-      collectors.push(healthFromResult(result, previousRows.length > 0));
-      limits.push(...rowsFromResult(result, previousRows));
+      const health = healthFromResult(
+        result,
+        previousRows,
+        previousHealth,
+        enabled.has(provider),
+        migrationApproved
+      );
+      collectors.push(health);
+      limits.push(...rowsFromResult(result, previousRows, health));
       continue;
     }
 
@@ -117,18 +177,27 @@ async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
     // config. Surface it as unavailable (not its stale `ok` health) and drop its
     // old rows so it disappears from the dashboard instead of looking current.
     if (!options.provider && !enabled.has(provider)) {
-      collectors.push(healthFromResult(disabledResult(provider), false));
+      collectors.push(
+        healthFromResult(
+          disabledResult(provider),
+          [],
+          previousHealth,
+          false,
+          migrationApproved
+        )
+      );
       continue;
     }
 
     if (previousHealth) {
-      collectors.push(previousHealth);
+      collectors.push({ ...previousHealth, enabled: enabled.has(provider) });
       limits.push(...previousRows);
       continue;
     }
 
     collectors.push({
       provider,
+      enabled: enabled.has(provider),
       ok: false,
       state: "stale",
       checkedAt: new Date().toISOString(),
@@ -137,11 +206,23 @@ async function runRefresh(options: RefreshOptions): Promise<UsageSnapshot> {
     });
   }
 
-  return writeSnapshot(rootDir, {
+  const snapshot = await writeSnapshot(rootDir, {
     generatedAt: new Date().toISOString(),
+    timezone: config.timezone,
     collectors,
     limits,
   });
+  // The compatibility report is a global canary result: it is authoritative
+  // only when every enabled provider was attempted in the same run. A
+  // provider-only UI refresh still updates the snapshot, but must not replace a
+  // previously green full-run report with a mixed-generation result.
+  if (!options.provider) {
+    await writeCompatibilityReport(
+      rootDir,
+      buildCompatibilityReport(snapshot, config.enabledProviders)
+    );
+  }
+  return snapshot;
 }
 
 async function runProviderCollector(
@@ -150,9 +231,23 @@ async function runProviderCollector(
   context: CollectorContext
 ): Promise<ProviderCollectorResult> {
   try {
-    return await collector(context);
+    const result = await collector(context);
+    if (result.provider !== provider) {
+      return verifyCollectorResult({
+        ...result,
+        provider,
+        ok: false,
+        state: "drift",
+        limits: [],
+        rawFileName: rawFileNameForProvider(provider),
+        error: `Adapter contract rejected the refresh: collector routed for ${JSON.stringify(
+          provider
+        )} returned provider ${JSON.stringify(result.provider)}`,
+      });
+    }
+    return verifyCollectorResult(result);
   } catch (error) {
-    return {
+    return verifyCollectorResult({
       provider,
       ok: false,
       state: "error",
@@ -163,7 +258,7 @@ async function runProviderCollector(
       cleanedText: "",
       rawFileName: rawFileNameForProvider(provider),
       error: error instanceof Error ? error.message : String(error),
-    };
+    });
   }
 }
 
@@ -185,40 +280,129 @@ function disabledResult(provider: UsageProvider): ProviderCollectorResult {
 
 function healthFromResult(
   result: ProviderCollectorResult,
-  hasPreviousRows: boolean
+  previousRows: UsageLimit[],
+  previous: CollectorHealth | undefined,
+  enabled: boolean,
+  migrationApproved: (input: RowInventoryMigrationInput) => boolean
 ): CollectorHealth {
+  const hasPreviousRows = previousRows.length > 0;
+  const previousRowIds = actionableRowIds(previousRows);
+  const currentRowIds = actionableRowIds(result.limits);
+  const formatChanged =
+    result.ok &&
+    previous?.formatFingerprint !== undefined &&
+    result.formatFingerprint !== undefined &&
+    previous.formatFingerprint !== result.formatFingerprint;
+  const rowInventoryChanged =
+    result.ok && previousRowIds.length > 0
+      ? !sameStringArray(previousRowIds, currentRowIds)
+      : undefined;
+  // A format-only parser update is intentional when the shipped adapter
+  // version changed. Actionable row additions/removals need a second, exact
+  // migration declaration; a version bump alone cannot authorize a subset.
+  const adapterUpdated =
+    result.ok &&
+    previous !== undefined &&
+    previous.adapterVersion !== result.adapterVersion;
+  const inventoryMigrationApproved =
+    rowInventoryChanged === true &&
+    adapterUpdated &&
+    migrationApproved({
+      provider: result.provider,
+      fromAdapterVersion: previous?.adapterVersion,
+      toAdapterVersion: result.adapterVersion,
+      previousRowIds,
+      currentRowIds,
+    });
+  const compatibilityDrift =
+    (formatChanged && !adapterUpdated) ||
+    (rowInventoryChanged === true && !inventoryMigrationApproved);
+  const attemptState = compatibilityDrift ? "drift" : result.state;
+  const accepted = result.ok && !compatibilityDrift;
   const state: CollectorState =
-    result.ok || !hasPreviousRows ? result.state : "stale";
+    accepted || !hasPreviousRows ? attemptState : "stale";
+  const attemptError = compatibilityDrift
+    ? compatibilityDriftMessage(formatChanged, rowInventoryChanged === true)
+    : result.error;
+  // A failed attempt has not established a new verified contract. Preserve
+  // the last accepted adapter/fingerprint so a repaired release with a bumped
+  // adapter can recover automatically on the next successful refresh. Storing
+  // a failed attempt's adapter here would consume that bump and deadlock the
+  // repaired result behind same-version drift quarantine.
+  const preserveVerifiedContract = state === "stale" && previous !== undefined;
   return {
     provider: result.provider,
-    ok: result.ok,
+    enabled,
+    ok: accepted,
     state,
+    attemptState,
     checkedAt: result.checkedAt,
     durationMs: result.durationMs,
+    adapterVersion: preserveVerifiedContract
+      ? previous.adapterVersion
+      : result.adapterVersion,
+    formatFingerprint: preserveVerifiedContract
+      ? previous.formatFingerprint
+      : result.formatFingerprint,
+    formatChanged,
+    rowInventoryChanged,
     error:
-      state === "stale" && result.error
-        ? `Last refresh ${result.state}: ${result.error}`
-        : result.error,
+      state === "stale" && attemptError
+        ? `Last refresh ${attemptState}: ${attemptError}`
+        : attemptError,
   };
+}
+
+function compatibilityDriftMessage(
+  formatChanged: boolean,
+  rowInventoryChanged: boolean
+): string {
+  if (formatChanged && rowInventoryChanged) {
+    return "Adapter contract rejected an unexpected provider format and quota-row inventory change.";
+  }
+  if (formatChanged) {
+    return "Adapter contract rejected an unexpected provider format change.";
+  }
+  return "Adapter contract rejected an unexpected quota-row inventory change.";
+}
+
+function actionableRowIds(rows: UsageLimit[]): string[] {
+  return rows
+    .filter(
+      (row) => !row.informational && !isConditionallyReportedLimit(row)
+    )
+    .map((row) => row.id)
+    .sort();
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
 }
 
 function rowsFromResult(
   result: ProviderCollectorResult,
-  previousRows: UsageLimit[]
+  previousRows: UsageLimit[],
+  health: CollectorHealth
 ): UsageLimit[] {
-  if (result.ok) return result.limits;
+  if (health.ok) {
+    return result.limits.map((row) => ({
+      ...row,
+      freshness: "verified",
+      error: undefined,
+    }));
+  }
   if (previousRows.length === 0) return [];
-  return previousRows.map((row) => markRowStale(row, result));
+  return previousRows.map((row) => markRowStale(row, health.error));
 }
 
-function markRowStale(
-  row: UsageLimit,
-  result: ProviderCollectorResult
-): UsageLimit {
+function markRowStale(row: UsageLimit, error?: string): UsageLimit {
   return {
     ...row,
-    status: deriveStatus(row.usedPercent, row.remainingPercent),
+    freshness: "stale",
     statusLabel: buildStaleStatusLabel(row.statusLabel),
-    error: result.error,
+    error,
   };
 }

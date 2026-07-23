@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $LauncherPath = Join-Path $RootDir "scripts/start-usage-viewer.ps1"
 $IconPath = Join-Path $RootDir "public/app-icon.ico"
-$AppUrl = "http://127.0.0.1:5174/"
+$AppUrl = "http://127.0.0.1:4317/"
 $DesktopDir = [Environment]::GetFolderPath("Desktop")
 $ShortcutPath = Join-Path $DesktopDir "AI Usage Viewer.lnk"
 $StartupDir = [Environment]::GetFolderPath("Startup")
@@ -16,7 +16,7 @@ if (-not (Test-Path $LauncherPath)) {
   throw "Launcher script not found: $LauncherPath"
 }
 if (-not (Test-Path $IconPath)) {
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RootDir "scripts/generate-app-icons.ps1")
+  & $PowerShellPath -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RootDir "scripts/generate-app-icons.ps1")
 }
 
 Add-Type -TypeDefinition @'
@@ -119,14 +119,14 @@ function Set-OpenShortcut {
   )
 
   # Always launch through the PowerShell launcher so a cold click (after a
-  # reboot, or if a server crashed) starts the API/Vite servers before opening
+  # reboot, or if the server crashed) starts the production server before opening
   # the dashboard. The launcher itself opens the Edge/Chrome app window. The
   # AppUserModelId set on the shortcut (when a browser exists) still groups that
   # app window under this pinned shortcut.
   $Shortcut.TargetPath = $PowerShellPath
   $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherPath`""
   $Shortcut.WorkingDirectory = $RootDir
-  $Shortcut.Description = "Start servers if needed and open the AI Usage Viewer dashboard"
+  $Shortcut.Description = "Start the local AI Usage Viewer and open its dashboard"
   $Shortcut.IconLocation = $IconPath
 }
 
@@ -160,7 +160,7 @@ $startup = $shell.CreateShortcut($StartupShortcutPath)
 $startup.TargetPath = $PowerShellPath
 $startup.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherPath`" -ServerOnly"
 $startup.WorkingDirectory = $RootDir
-$startup.Description = "Start the local AI Usage Viewer servers at sign-in"
+$startup.Description = "Start the local AI Usage Viewer server at sign-in"
 $startup.IconLocation = $IconPath
 $startup.Save()
 

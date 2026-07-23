@@ -39,6 +39,8 @@ const BAR_PERCENT_RE = /(\d+(?:\.\d+)?)%\s*$/;
 const REFRESH_RE = /Refreshes?\s+in\s+(.+?)\s*$/i;
 const QUOTA_STATUS_RE = /\bQuota\s+\w+/i;
 const PAGER_RE = /Scroll|pgup|pgdown|ctrl\+(?:end|home)|esc Close|Navigate|Select|Complete/i;
+const UNKNOWN_LIMIT_RE = /\bLimit\s*$/i;
+const POSSIBLE_GROUP_HEADER_RE = /^[A-Z][A-Z0-9 &/+.-]{2,}$/;
 
 type AgyWindow = "weekly" | "5h";
 
@@ -49,8 +51,9 @@ export function parseAgyQuota(
 ): UsageLimit[] {
   const lines = text.split("\n").map((line) => line.trim());
   const pinned = new Set(pinnedGroups.map((group) => group.toLowerCase()));
-  const seen = new Set<string>();
-  const rows: UsageLimit[] = [];
+  const latestCompletion = new Map<string, boolean>();
+  const rows = new Map<string, UsageLimit>();
+  const unknownLimitHeadings: string[] = [];
   let group: string | undefined;
 
   for (let i = 0; i < lines.length; i += 1) {
@@ -64,20 +67,26 @@ export function parseAgyQuota(
         : undefined;
 
     if (window) {
+      const groupName = group ?? "Antigravity";
+      const id = `agy:${slugifyId(groupName)}:${window}`;
+      latestCompletion.set(id, false);
       const bar = findBarLine(lines, i + 1);
       if (!bar) continue; // incomplete section (redraw fragment) — skip
       const statusLine = statusLineAfter(lines, bar.index);
       i = statusLine ? bar.index + 1 : bar.index;
 
       const remainingPercent = Number(bar.percent);
-      const groupName = group ?? "Antigravity";
-      const id = `agy:${slugifyId(groupName)}:${window}`;
-      if (seen.has(id)) continue; // ignore duplicate redraw frames
-      seen.add(id);
-      if (pinned.size > 0 && !pinned.has(groupName.toLowerCase())) continue;
+      if (!Number.isFinite(remainingPercent) || remainingPercent < 0 || remainingPercent > 100) {
+        throw new ParserDriftError(
+          `Agy quota percentage for "${groupName}" was outside 0..100.`,
+          text
+        );
+      }
+      latestCompletion.set(id, true);
 
       const { statusLabel, resetLabel } = parseStatusLine(statusLine, remainingPercent);
-      rows.push(
+      rows.set(
+        id,
         limitFromRemaining({
           id,
           provider: "agy",
@@ -97,17 +106,35 @@ export function parseAgyQuota(
     }
 
     const header = extractGroupName(line);
-    if (header) group = header;
+    if (header) {
+      group = header;
+    } else if (POSSIBLE_GROUP_HEADER_RE.test(line)) {
+      unknownLimitHeadings.push(line);
+      group = undefined;
+    } else if (UNKNOWN_LIMIT_RE.test(line) && !PAGER_RE.test(line)) {
+      unknownLimitHeadings.push(line);
+    }
   }
 
-  if (rows.length === 0) {
+  const incomplete = [...latestCompletion.values()].some((complete) => !complete);
+  if (incomplete || unknownLimitHeadings.length > 0) {
+    throw new ParserDriftError(
+      "Agy output contained an incomplete or unrecognized quota section.",
+      text
+    );
+  }
+
+  const visibleRows = [...rows.values()].filter(
+    (row) => pinned.size === 0 || pinned.has(row.scope.toLowerCase())
+  );
+  if (visibleRows.length === 0) {
     throw new ParserDriftError(
       "Agy output contained no recognized quota groups.",
       text
     );
   }
 
-  return rows;
+  return visibleRows;
 }
 
 function findBarLine(

@@ -8,7 +8,7 @@ information from local CLI tools:
 - Claude Code
 - OpenAI Codex
 - Antigravity CLI (`agy`)
-- Grok Build CLI in WSL
+- Grok Build CLI (native Windows binary)
 
 This dashboard is for OAuth/subscription usage surfaces, not API billing or API
 token usage.
@@ -20,7 +20,7 @@ token usage.
 Source:
 
 ```bash
-claude
+claude --ax-screen-reader
 /usage
 ```
 
@@ -30,7 +30,8 @@ Confirmed output includes:
 - Current session reset time
 - Current week all-models usage percent
 - Current week all-models reset time
-- Current week Sonnet-only usage percent
+- Zero or more model-specific weekly usage percentages (for example, Fable)
+- Usage credits percent when present
 - Local contribution notes
 
 Example observed values:
@@ -44,8 +45,11 @@ Current week (all models)
 6% used
 Resets Jun 9, 4pm (Asia/Seoul)
 
-Current week (Sonnet only)
-0% used
+Current week (Fable)
+6% used
+
+Usage credits
+11% used
 ```
 
 Auth/status source:
@@ -65,14 +69,22 @@ Confirmed output includes:
 
 ### Codex
 
-Source:
+Primary source:
+
+```text
+codex app-server
+initialize -> initialized -> account/rateLimits/read
+```
+
+The app-server returns structured, versioned rate-limit buckets with primary,
+secondary, and optional individual spend-control windows. No terminal layout
+parsing is required on this path.
+
+Fallback source for older or incompatible Codex builds:
 
 ```bash
 codex --no-alt-screen
 ```
-
-Codex does not expose a `/usage` slash command in the tested version. Usage is
-shown in the TUI footer.
 
 Confirmed footer examples:
 
@@ -93,7 +105,7 @@ Confirmed output:
 Logged in using ChatGPT
 ```
 
-Implementation note:
+Fallback implementation note:
 
 - Start Codex with `--no-alt-screen`.
 - Skip/update prompts if shown.
@@ -104,12 +116,17 @@ Implementation note:
 
 Source:
 
-```bash
-agy
-/quota
+```text
+start agy headlessly with a private temporary log
+discover its loopback HTTP port
+POST /exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary
 ```
 
-Confirmed output includes model quota rows:
+The structured response contains model groups and quota buckets with
+`window`, `remainingFraction`, and `resetTime`. The dashboard must not open or
+scrape the interactive `/quota` screen during background collection.
+
+Legacy confirmed `/quota` output includes model quota rows:
 
 ```text
 Model Quota
@@ -146,36 +163,28 @@ Implementation note:
 
 ### Grok
 
-Observed manual-test source runs inside WSL:
+Current source:
 
 ```bash
-wsl -e sh -lc "cd <configured-wsl-cwd> && grok --no-alt-screen"
-/usage
-show
-```
-
-Implementation should use the configured WSL cwd and command from `config.json`
-rather than this machine-specific path.
-
-Confirmed WSL location:
-
-```text
-~/.local/bin/grok -> ~/.grok/bin/grok
-~/.grok/bin/grok -> ../downloads/grok-<version>-linux-x86_64
+grok --no-alt-screen
+/usage show
 ```
 
 Confirmed output:
 
 ```text
-Credits used: 44%
-Resets: Jun 30, 16:00 PT
+[stable] Weekly limit left: 17%
+Weekly limit: 83%  Next reset: July 31, 16:00 PT
 ```
 
 Implementation note:
 
-- Grok may be installed inside a configured WSL distro.
-- Use `wsl -e sh -lc ...` from the Windows backend.
-- TUI command is `/usage`, then select `show`.
+- Launch the configured native `grokCommand` (default `grok` on PATH).
+- Treat the weekly footer as remaining quota and the current `/usage show`
+  weekly value as used quota, verifying that they add to 100. Legacy monthly
+  detail remains supported as a separate row.
+- If the detail interaction changes but the weekly footer is complete, publish
+  that verified row rather than inventing monthly data.
 
 ## Non-Goals
 
@@ -195,7 +204,7 @@ Use a local app with a small backend and a dashboard frontend.
 Dashboard UI
   -> local backend HTTP API
     -> collector runner
-      -> CLI PTY sessions
+      -> structured local protocol or isolated CLI PTY session
       -> parsers
       -> normalized snapshot
       -> JSON file or SQLite
@@ -242,11 +251,7 @@ type AppConfig = {
     pinnedGroups: string[]; // model-group names; empty means show all rows
   };
   timezone: string; // used only for future resetAt normalization
-  wsl: {
-    distro?: string;
-    cwd: string;
-    grokCommand: string;
-  };
+  grokCommand?: string;
   planLabelFallback: Partial<Record<UsageProvider, string>>;
 };
 ```
@@ -355,6 +360,7 @@ Each collector should return:
 - Parsed `UsageLimit[]`
 - Duration
 - Error state, if any
+- Adapter version and privacy-safe format fingerprint
 
 Collectors should not block the whole refresh. If one provider fails, the
 dashboard should show stale data or the provider's failure state while others
@@ -367,6 +373,8 @@ Collector failure handling:
 - If output is captured but required parser anchors are missing, return `drift`.
 - Persist raw output for `error` and `drift` cases to support parser fixes.
 - Do not coerce incomplete parser results into real quota rows.
+- Reject duplicate IDs, impossible percentages, cross-provider rows, and
+  unrecognized percentage-bearing sections before replacing verified data.
 
 Auth and plan status should be cached separately from quota refreshes because it
 rarely changes. The refresh flow may reuse cached account labels unless the user
@@ -416,11 +424,12 @@ ANSI stripping:
 Flow:
 
 ```text
+probe claude --help and prefer --ax-screen-reader
 spawn claude
 wait for prompt
 send "/usage\r"
-wait for "Current session" and "Current week"
-optionally page down once to capture Sonnet-only if needed
+wait for complete session and all-model weekly values
+allow optional model-specific and credits rows to settle
 send escape
 send "/exit\r"
 parse output
@@ -431,7 +440,8 @@ Parser patterns:
 ```text
 Current session\s+(\d+)% used\s+Resets ([^\n]+)
 Current week \(all models\)\s+(\d+)% used\s+Resets ([^\n]+)
-Current week \(Sonnet only\)\s+(\d+)% used
+Current week \(([^)]+)\)\s+(\d+)% used
+Usage credits\s+(\d+)% used
 ```
 
 Also run:
@@ -444,7 +454,20 @@ Use this for account and plan labels.
 
 ### Codex Collector
 
-Flow:
+Primary flow:
+
+```text
+spawn codex app-server over stdio
+send initialize
+send initialized
+send account/rateLimits/read
+strictly validate every returned bucket/window
+normalize structured percentages and reset timestamps
+```
+
+If app-server is unavailable or its protocol/method is unsupported, fall back
+silently to the terminal flow. A successfully returned but unrecognized schema
+fails closed instead, because the smaller terminal view could hide a new quota:
 
 ```text
 spawn codex --no-alt-screen
@@ -493,42 +516,38 @@ secondary metadata instead of a quota warning source.
 Flow:
 
 ```text
-spawn agy
-if workspace trust prompt appears, select "Yes"
-wait for prompt
-send "/quota\r"
-wait for "Model Quota"
-page down until no new model rows appear
-send escape
-send "/exit\r"
-parse output
+resolve agy once to a trusted absolute executable path
+spawn it through a hidden kill-on-close Windows Job Object host
+give agy immediate stdin EOF so invisible prompts fail closed
+read only the exact loopback HTTP port emitted by that process
+request RetrieveUserQuotaSummary with a bounded Connect JSON request
+close the host lease so Windows terminates the complete process tree
+delete the permission-restricted, size-capped temporary log
+validate and normalize grouped quota buckets
 ```
 
 Parser approach:
 
-- Use a 3-line heuristic instead of a broad model-name regex.
-- A row starts with a plausible model name line.
-- The next non-empty line with a trailing percent is the quota line.
-- The next non-empty line is the status label, for example `Quota available`.
-- Continue paging until the cleaned panel frame repeats or no new model names
-  are found after a page-down.
-- If the model/bar/status sequence is broken, mark the collector as `drift`.
+- Require grouped buckets with a finite `remainingFraction` from 0 through 1.
+- Preserve `weekly` and `5h` windows and exact RFC 3339 reset times.
+- Apply `agy.pinnedGroups` after validating the complete response.
+- Reject unsupported quota-bearing shapes as `drift`; never fall back to the
+  interactive terminal on Windows because that can reintroduce a visible flash.
+- Persist only a canonical privacy-filtered quota shape, not the complete local
+  service response or temporary AGY log.
 
-Known model-name prefixes include `Gemini`, `Claude`, `GPT`, and `GPT-OSS`, but
-the parser should not use a catch-all prefix that matches arbitrary UI text.
-
-Output row:
+Output rows:
 
 ```ts
 {
   provider: "agy",
   providerLabel: "Antigravity",
-  planLabel: sourcePlanLabel ?? config.planLabelFallback.agy,
-  scope: modelName,
-  window: "model-quota",
-  remainingPercent: percent,
-  usedPercent: 100 - percent,
-  statusLabel: statusLine
+  planLabel: config.planLabelFallback.agy,
+  scope: group.displayName,
+  window: bucket.window,
+  remainingPercent: bucket.remainingFraction * 100,
+  usedPercent: 100 - remainingPercent,
+  resetAt: bucket.resetTime
 }
 ```
 
@@ -537,12 +556,10 @@ Output row:
 Flow:
 
 ```text
-spawn wsl -e sh -lc "cd <config.wsl.cwd> && <config.wsl.grokCommand> --no-alt-screen"
-wait for prompt
-send "/usage\r"
-wait for "show"
-send "\r"
-wait for "Credits used"
+spawn <config.grokCommand ?? "grok"> --no-alt-screen
+wait for "Weekly limit left"
+send "/usage " and accept the highlighted "show" action
+wait for "Weekly limit" or legacy "Monthly limit"
 send "/quit\r"
 parse output
 ```
@@ -550,23 +567,19 @@ parse output
 Parser patterns:
 
 ```text
-Credits used:\s*(\d+)%
-Resets:\s*([^\n]+)
+Weekly limit left:\s*(\d+)%
+Weekly limit:\s*(\d+)%
+Monthly limit:\s*(\d+)%
+Next reset:\s*([^\n]+)
 ```
 
 Output row:
 
 ```ts
-{
-  provider: "grok",
-  providerLabel: "Grok",
-  planLabel: config.planLabelFallback.grok ?? "SuperGrok",
-  scope: "Free credits",
-  window: "monthly",
-  usedPercent: creditsUsed,
-  remainingPercent: 100 - creditsUsed,
-  resetLabel: resetText
-}
+[
+  limitFromRemaining({ scope: "Weekly limit", window: "weekly", remainingPercent: weeklyLeft }),
+  limitFromUsed({ scope: "Monthly limit", window: "monthly", usedPercent: monthlyUsed, resetLabel: resetText })
+]
 ```
 
 ## Dashboard UI
@@ -585,41 +598,31 @@ Main screen:
   - Antigravity
   - Grok
 
-- Detailed table
-  - Provider
-  - Plan
-  - Scope/model
-  - Window
-  - Used
-  - Remaining
-  - Reset
-  - Last checked
-  - Status
-
 Card display rules:
 
 - Show the most important rows per provider.
 - Use progress bars based on used percent.
 - Show both used and remaining when useful.
-- Keep raw source text available behind an expand/copy action for debugging.
+- Keep parser and raw-output diagnostics outside the normal user interface.
 
 Colors:
 
 - Green: available
 - Yellow: warning
 - Red: exhausted
-- Gray: unknown, unavailable, or stale
-- Orange: collector error
-- Purple/blue-gray: drift / parser format changed
+- Gray: unknown usage
 
 Failure display rules:
 
-- `unavailable`: show "not installed" or "not logged in" without treating it as
-  a failed app state.
-- `error`: show collector failure and keep the previous snapshot row if one
-  exists.
-- `drift`: show "format changed" and link to raw output for parser debugging.
-- `stale`: show the last successful value with a stale timestamp badge.
+- When a refresh is unavailable, errors, or detects format drift, keep showing
+  the last contract-verified rows without presenting a test or repair workflow
+  to the user.
+- If a provider has never produced verified rows, omit its empty card from the
+  normal dashboard.
+- Preserve the machine-readable attempt state and redacted diagnostics in the
+  local snapshot/compatibility report for monitoring and repair tooling.
+- The user sees a replacement only after the updated adapter has passed its
+  parser contract and full compatibility check.
 
 Example card rows:
 
@@ -649,6 +652,7 @@ MVP backend endpoints:
 
 ```text
 GET  /api/snapshot
+GET  /api/identity
 POST /api/refresh
 POST /api/refresh/:provider
 GET  /api/raw/:provider
@@ -678,19 +682,32 @@ Refresh locking:
 Default:
 
 - Manual refresh button.
-- Background refresh is optional and disabled by default for the MVP.
+- Refresh automatically when the dashboard opens.
+- The production server runs a compatibility refresh every six hours without
+  overlapping a user-initiated refresh.
 
 Timeouts:
 
-- Claude: 20 seconds
-- Codex: 20 seconds for default account-limit collection
+- Claude: 60 seconds (includes slow MCP startup and optional usage credits)
+- Codex: 8 seconds for app-server, 40 seconds for terminal fallback
 - Agy: 30 seconds
-- Grok: 20 seconds
+- Grok: 30 seconds
 
-Do not refresh faster than once per minute automatically. If background refresh
-is enabled later, skip it while a manual refresh is running. Avoid interrupting
-active user CLI sessions where practical; at minimum, never run two collector
-sessions for the same provider concurrently.
+Do not refresh faster than once per minute automatically. The six-hour monitor
+skips while a manual refresh is running. A workspace-scoped Windows named-pipe
+mutex also prevents a separate collector process from driving the same CLIs
+concurrently; `data/refresh.lock` is diagnostic metadata, not the mutex itself.
+
+A separate scheduled compatibility workflow may run the same full check every
+six hours on a dedicated self-hosted Windows canary. That runner uses isolated
+non-personal test accounts, uploads only the redacted compatibility report,
+opens one tracking issue on drift, and closes it after recovery. Personal OAuth
+state and raw transcripts must never be sent to GitHub-hosted runners. Manual
+baseline acceptance begins in an unprivileged default-branch request workflow;
+the credentialed canary is loaded from the protected default branch and waits
+for approval on the protected environment. Scheduled runs only compare against
+a validated runner-owned baseline. A missing or malformed baseline fails closed
+and cannot be replaced by a scheduled run.
 
 ## Persistence
 
@@ -699,6 +716,7 @@ MVP:
 ```text
 config.json
 data/usage-snapshot.json
+data/compatibility-report.json
 data/raw/claude.txt
 data/raw/codex-default.txt
 data/raw/agy.txt
@@ -765,11 +783,14 @@ create unique index idx_usage_limits_snap_limit
 Parser unit tests:
 
 - Claude sample `/usage` output.
-- Codex footer sample.
+- Current Claude model-specific and credits output.
+- Codex structured app-server payloads plus footer fallback samples.
 - Agy quota sample with multiple model rows.
 - Grok usage sample.
 - ANSI-heavy terminal redraw samples using raw PTY transcripts.
 - Drift samples where required anchors are missing.
+- Completeness samples where a valid section appears beside an unknown quota.
+- Adapter contract and format-fingerprint tests.
 - Redaction samples for email/account-like values.
 
 Collector integration tests:
@@ -862,7 +883,7 @@ Accepted into the main spec:
 - Mark Codex `Context` as informational.
 - Keep `resetAt` optional for MVP and display raw `resetLabel`.
 - Add a refresh mutex.
-- Move machine-specific WSL paths and fallback labels into `config.json`.
+- Keep provider command paths and fallback labels in `config.json`.
 - Redact stored raw output and add `data/` to `.gitignore`.
 - Fix the optional SQLite schema with a surrogate `row_id` and stable
   `limit_id`.
@@ -873,7 +894,7 @@ Adjusted rather than fully accepted:
 
 - SQLite remains optional and post-MVP. The corrected schema is documented only
   for the later history feature.
-- Background refresh is disabled by default for MVP instead of trying to detect
-  active user CLI sessions immediately.
+- Background compatibility refresh runs every six hours and never overlaps a
+  manual or separate-process refresh.
 - Additional Codex model collection is not part of the default MVP. It is limited
   to optional context metadata if enabled later.

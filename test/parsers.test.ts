@@ -17,6 +17,7 @@ const fixtureDir = join(import.meta.dirname, "fixtures");
 const meta = {
   checkedAt: "2026-06-03T12:00:00.000Z",
   sourceCommand: "fixture",
+  sourceTimeZone: "Asia/Seoul",
   planLabel: "Fixture Plan",
   accountLabel: "person@example.com",
 };
@@ -48,20 +49,71 @@ describe("provider parsers", () => {
       "",
       "Current week (all models)",
       "20% used",
-      "Resets Jul 7, 4pm (Asia/Seoul)",
+      "Resets Jun 7, 4pm (Asia/Seoul)",
       "",
       "What's contributing to your limits usage?",
     ].join("\n");
     const limits = parseClaudeUsage(text, meta);
     expect(limits).toHaveLength(2);
     expect(pick(limits, "claude:session")).toMatchObject({ usedPercent: 3 });
-    expect(pick(limits, "claude:week-all")).toMatchObject({ usedPercent: 20 });
+    expect(pick(limits, "claude:week-all")).toMatchObject({
+      usedPercent: 20,
+      sourceText: expect.not.stringContaining("What's contributing"),
+    });
     expect(limits.find((l) => l.id === "claude:week-sonnet")).toBeUndefined();
   });
 
   it("uses configured Claude Max tier label when auth only reports max", () => {
     const auth = parseClaudeAuthStatus("loggedIn: true\nsubscriptionType: max\n");
     expect(claudePlanLabel(auth, "Max 200")).toBe("Max 200");
+  });
+
+  it("rejects an implausible required Claude reset and omits an invalid optional one", () => {
+    expect(() =>
+      parseClaudeUsage(
+        [
+          "Current session",
+          "3% used",
+          "Current week (all models)",
+          "20% used",
+          "Resets in 104000000d",
+        ].join("\n"),
+        meta
+      )
+    ).toThrow(ParserDriftError);
+
+    const limits = parseClaudeUsage(
+      [
+        "Current session",
+        "3% used",
+        "Resets after billing review",
+        "Current week (all models)",
+        "20% used",
+        "Resets Jun 7, 4pm (Asia/Seoul)",
+      ].join("\n"),
+      meta
+    );
+    expect(pick(limits, "claude:session").resetLabel).toBeUndefined();
+  });
+
+  it("parses the current JSON Claude auth status without skipping login", () => {
+    const auth = parseClaudeAuthStatus(
+      JSON.stringify({
+        loggedIn: true,
+        email: "person@example.com",
+        orgId: "org_fixture",
+        orgName: "Fixture Organization",
+        subscriptionType: "max",
+      })
+    );
+
+    expect(auth).toEqual({
+      loggedIn: true,
+      email: "person@example.com",
+      orgId: "org_fixture",
+      orgName: "Fixture Organization",
+      subscriptionType: "max",
+    });
   });
 
   it("parses Codex footer fixture", async () => {
@@ -130,6 +182,19 @@ describe("provider parsers", () => {
       remainingPercent: 74,
       usedPercent: 26,
     });
+  });
+
+  it("rejects out-of-range Codex TUI percentages", () => {
+    const footer =
+      "gpt-5.5 - Context 100% left - 5h 120% left - weekly 76% left";
+    expect(() => parseCodexFooter(footer, meta)).toThrow(ParserDriftError);
+
+    const status = [
+      "gpt-5.5 - Context 100% left - 5h 97% left - weekly 76% left",
+      "Experimental limit:",
+      "5h limit: 120% left (resets 19:00 on 4 Jun)",
+    ].join("\n");
+    expect(() => parseCodexFooter(status, meta)).toThrow(ParserDriftError);
   });
 
   it("deduplicates repeated Codex status blocks", () => {
@@ -283,6 +348,79 @@ describe("provider parsers", () => {
       status: "exhausted",
       resetLabel: "Resets Aug 1, 09:00 PT",
     });
+  });
+
+  it("accepts the current zone-less Grok reset and unknown-period fallback", () => {
+    const limits = parseGrokUsage(
+      "Usage: 50% · Next reset: Mar 31, 12:00",
+      meta
+    );
+
+    expect(pick(limits, "grok:usage")).toMatchObject({
+      usedPercent: 50,
+      remainingPercent: 50,
+      resetLabel: "Resets Mar 31, 12:00",
+    });
+  });
+
+  it("keeps paid Grok continuation capacity visible after included usage", () => {
+    const limits = parseGrokUsage(
+      [
+        "Usage: 100%",
+        "Credits: $5.00",
+        "Auto topup: disabled",
+        "Pay-as-you-go: $2.00 used of $10.00 limit",
+      ].join("\n"),
+      meta
+    );
+
+    expect(pick(limits, "grok:usage")).toMatchObject({
+      usedPercent: 100,
+      remainingPercent: 0,
+      status: "warning",
+      statusLabel: "Included usage exhausted; paid usage remains available",
+    });
+    expect(pick(limits, "grok:credits")).toMatchObject({
+      status: "available",
+      informational: true,
+      statusLabel: "$5.00 available",
+    });
+    expect(pick(limits, "grok:pay-as-you-go")).toMatchObject({
+      usedPercent: 20,
+      remainingPercent: 80,
+      status: "available",
+    });
+    expect(pick(limits, "grok:auto-topup")).toMatchObject({
+      informational: true,
+      statusLabel: "Disabled",
+    });
+  });
+
+  it("fails closed on malformed or contradictory Grok billing fields", () => {
+    expect(() =>
+      parseGrokUsage("Usage: 50%\nAuto topup: maybe", meta)
+    ).toThrow(ParserDriftError);
+    expect(() =>
+      parseGrokUsage("Usage: 50%\nCredits: $1\nCredits: $2", meta)
+    ).toThrow(ParserDriftError);
+    expect(() =>
+      parseGrokUsage(
+        "Usage: 50%\nPay-as-you-go: $11 used of $10 limit",
+        meta
+      )
+    ).toThrow(ParserDriftError);
+  });
+
+  it("rejects partial warning footers and inconsistent duplicate values", () => {
+    expect(() =>
+      parseGrokUsage("Weekly limit left: 9%", meta)
+    ).toThrow(ParserDriftError);
+    expect(() =>
+      parseGrokUsage(
+        "Weekly limit: 20%\nWeekly limit: 21%\nWeekly limit left: 80%",
+        meta
+      )
+    ).toThrow(ParserDriftError);
   });
 
   it("throws drift when anchors are missing", async () => {

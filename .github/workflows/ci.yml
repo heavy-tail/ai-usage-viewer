@@ -1,0 +1,303 @@
+name: CI and Delivery
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify on Windows
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Audit the complete dependency graph
+        # No --omit flag: build/test tooling is part of the delivered supply chain.
+        run: npm audit --audit-level=low
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build production dashboard
+        run: npm run build
+
+      - name: Stage Windows Node deployment bundle
+        shell: pwsh
+        run: |
+          $packageVersion = (Get-Content -Raw "package.json" | ConvertFrom-Json).version
+          if ($packageVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "package.json contains an invalid release version: $packageVersion"
+          }
+          $safeVersion = $packageVersion -replace '[^A-Za-z0-9._-]', '-'
+          $releaseDir = Join-Path $PWD ".release"
+          $bundleDir = Join-Path $releaseDir "usage-viewer"
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+
+          Copy-Item -Recurse "dist" $bundleDir
+          Copy-Item -Recurse "public" $bundleDir
+          Copy-Item -Recurse "scripts" $bundleDir
+          Copy-Item -Recurse "src" $bundleDir
+          Copy-Item "config.example.json", "index.html", "LICENSE", "package.json", "package-lock.json", "README.md", "tsconfig.json", "vite.config.ts" $bundleDir
+
+          if ($env:GITHUB_SHA -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "GITHUB_SHA is not a full Git commit id."
+          }
+          $provenance = [ordered]@{
+            schemaVersion = 1
+            sourceRepository = $env:GITHUB_REPOSITORY
+            sourceCommit = $env:GITHUB_SHA.ToLowerInvariant()
+            packageVersion = $packageVersion
+          } | ConvertTo-Json
+          $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText(
+            (Join-Path $bundleDir "BUILD-PROVENANCE.json"),
+            "$provenance`n",
+            $utf8WithoutBom
+          )
+
+          @"
+          AI Usage Viewer Windows/Node deployment bundle
+
+          This is not a portable installer. It requires Windows, Node.js 24,
+          npm, and whichever provider CLIs you use. After extracting:
+
+            npm ci
+            copy config.example.json config.json
+            npm start
+
+          Then open http://127.0.0.1:4317/.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $bundleDir "DEPLOYMENT.txt")
+
+          # ZipArchive is used directly so entry order and timestamps are stable.
+          # Given identical build output, this produces an identical archive hash.
+          $archive = Join-Path $releaseDir "usage-viewer-$safeVersion-windows-node.zip"
+          Add-Type -AssemblyName System.IO.Compression
+          $archiveStream = [System.IO.File]::Open(
+            $archive,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+          )
+          $zip = [System.IO.Compression.ZipArchive]::new(
+            $archiveStream,
+            [System.IO.Compression.ZipArchiveMode]::Create,
+            $false,
+            [System.Text.Encoding]::UTF8
+          )
+          try {
+            [string[]] $relativePaths = @(
+              Get-ChildItem -LiteralPath $bundleDir -Recurse -File | ForEach-Object {
+                $_.FullName.Substring($bundleDir.Length + 1).Replace('\', '/')
+              }
+            )
+            [Array]::Sort($relativePaths, [StringComparer]::Ordinal)
+            $fixedTimestamp = [DateTimeOffset]::Parse("1980-01-01T00:00:00Z")
+
+            foreach ($relativePath in $relativePaths) {
+              $entry = $zip.CreateEntry(
+                "usage-viewer/$relativePath",
+                [System.IO.Compression.CompressionLevel]::Optimal
+              )
+              $entry.LastWriteTime = $fixedTimestamp
+              $entry.ExternalAttributes = 0
+              $sourcePath = Join-Path $bundleDir $relativePath.Replace('/', [IO.Path]::DirectorySeparatorChar)
+              $source = [System.IO.File]::OpenRead($sourcePath)
+              $destination = $entry.Open()
+              try {
+                $source.CopyTo($destination)
+              } finally {
+                $destination.Dispose()
+                $source.Dispose()
+              }
+            }
+          } finally {
+            $zip.Dispose()
+            $archiveStream.Dispose()
+          }
+
+          $checksum = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$checksum *$(Split-Path -Leaf $archive)" | Set-Content -Encoding ascii "$archive.sha256"
+
+      - name: Smoke-test the staged deployment bundle
+        shell: pwsh
+        run: |
+          $archive = @(Get-ChildItem -LiteralPath ".release" -Filter "*.zip" -File)
+          if ($archive.Count -ne 1) {
+            throw "Expected exactly one staged deployment archive; found $($archive.Count)."
+          }
+          # Workflow steps run in separate PowerShell processes, so recompute
+          # the expected version instead of relying on the staging step's local
+          # $packageVersion variable.
+          $expectedPackageVersion =
+            (Get-Content -Raw "package.json" | ConvertFrom-Json).version
+
+          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $smokeRoot = [IO.Path]::GetFullPath(
+            (Join-Path $runnerTemp "usage-viewer-smoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT")
+          )
+          if (-not $smokeRoot.StartsWith("$runnerTemp\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to use a smoke-test path outside RUNNER_TEMP: $smokeRoot"
+          }
+          $stdout = Join-Path $env:RUNNER_TEMP "usage-viewer-smoke-$env:GITHUB_RUN_ID.out.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "usage-viewer-smoke-$env:GITHUB_RUN_ID.err.log"
+          $server = $null
+          try {
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+            Expand-Archive -LiteralPath $archive[0].FullName -DestinationPath $smokeRoot
+            $bundleRoot = Join-Path $smokeRoot "usage-viewer"
+            $bundlePackage = Get-Content -Raw (Join-Path $bundleRoot "package.json") |
+              ConvertFrom-Json
+            $bundleProvenance = Get-Content -Raw (Join-Path $bundleRoot "BUILD-PROVENANCE.json") |
+              ConvertFrom-Json
+            if ([string]$bundlePackage.version -ne [string]$bundleProvenance.packageVersion -or
+                [string]$bundleProvenance.packageVersion -ne $expectedPackageVersion -or
+                [string]$bundleProvenance.sourceRepository -ne $env:GITHUB_REPOSITORY -or
+                [string]$bundleProvenance.sourceCommit -ne $env:GITHUB_SHA.ToLowerInvariant()) {
+              throw "The extracted bundle provenance does not match this CI run."
+            }
+
+            # This is deliberately a clean install from the files actually in the ZIP.
+            Push-Location $bundleRoot
+            try {
+              & npm.cmd ci --no-audit --no-fund
+              if ($LASTEXITCODE -ne 0) {
+                throw "npm ci failed inside the extracted deployment bundle."
+              }
+            } finally {
+              Pop-Location
+            }
+
+            # Disable collectors so the smoke test can never touch developer/provider accounts.
+            '{"enabledProviders":[],"timezone":"UTC"}' |
+              Set-Content -LiteralPath (Join-Path $bundleRoot "config.json") -Encoding utf8
+
+            $listener = [System.Net.Sockets.TcpListener]::new(
+              [System.Net.IPAddress]::Loopback,
+              0
+            )
+            $listener.Start()
+            $port = ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
+            $listener.Stop()
+
+            $oldPort = $env:PORT
+            $oldInterval = $env:COMPATIBILITY_CHECK_INTERVAL_MINUTES
+            try {
+              $env:PORT = "$port"
+              $env:COMPATIBILITY_CHECK_INTERVAL_MINUTES = "1440"
+              $server = Start-Process `
+                -FilePath "node.exe" `
+                -ArgumentList @("--import", "tsx", "src/server.ts") `
+                -WorkingDirectory $bundleRoot `
+                -PassThru `
+                -RedirectStandardOutput $stdout `
+                -RedirectStandardError $stderr
+            } finally {
+              $env:PORT = $oldPort
+              $env:COMPATIBILITY_CHECK_INTERVAL_MINUTES = $oldInterval
+            }
+
+            $baseUrl = "http://127.0.0.1:$port"
+            $deadline = (Get-Date).AddSeconds(30)
+            $ready = $false
+            while ((Get-Date) -lt $deadline) {
+              $server.Refresh()
+              if ($server.HasExited) {
+                throw "The extracted deployment server exited during startup."
+              }
+              try {
+                $root = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 2
+                $snapshot = Invoke-RestMethod -Uri "$baseUrl/api/snapshot" -TimeoutSec 2
+                $identity = Invoke-RestMethod -Uri "$baseUrl/api/identity" -TimeoutSec 2
+                if ($root.StatusCode -eq 200 -and
+                    $root.Content -like '*id="root"*' -and
+                    $null -ne $snapshot.snapshot -and
+                    [int] $identity.pid -eq $server.Id) {
+                  $ready = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+            }
+            if (-not $ready) {
+              throw "The extracted deployment bundle did not pass its HTTP smoke test within 30 seconds."
+            }
+          } finally {
+            if ($null -ne $server) {
+              $server.Refresh()
+              if (-not $server.HasExited) {
+                & (Join-Path $env:SystemRoot "System32\taskkill.exe") `
+                  /pid $server.Id /T /F | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Could not terminate the smoke-test server tree."
+                }
+                $server.WaitForExit(10000) | Out-Null
+                $server.Refresh()
+                if (-not $server.HasExited) {
+                  throw "The smoke-test server tree did not exit."
+                }
+              }
+            }
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload deployment bundle
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: usage-viewer-windows-node-${{ github.run_number }}
+          path: |
+            .release/*.zip
+            .release/*.sha256
+          if-no-files-found: error
+          # Stable across partial reruns so downstream failed jobs can still
+          # consume a bundle produced by an earlier attempt of this workflow.
+          overwrite: true
+          retention-days: 30
+
+  attest:
+    name: Attest deployment bundle
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download verified deployment bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: usage-viewer-windows-node-${{ github.run_number }}
+          path: bundle
+
+      - name: Attest deployment bundle provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: bundle/*.zip

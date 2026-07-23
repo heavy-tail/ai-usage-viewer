@@ -59,6 +59,33 @@ describe("snapshot view helpers", () => {
     expect(actionableUsageLimits([contextOnly, quota])).toEqual([quota]);
   });
 
+  it("shows enabled first-run failures and hides explicitly disabled providers", () => {
+    const snapshot: UsageSnapshot = {
+      generatedAt: "2026-07-18T12:00:00.000Z",
+      collectors: [
+        {
+          provider: "claude",
+          enabled: true,
+          ok: false,
+          state: "error",
+          checkedAt: "2026-07-18T12:00:00.000Z",
+          durationMs: 1,
+        },
+        {
+          provider: "grok",
+          enabled: false,
+          ok: false,
+          state: "unavailable",
+          checkedAt: "2026-07-18T12:00:00.000Z",
+          durationMs: 1,
+        },
+      ],
+      limits: [limit("grok")],
+    };
+
+    expect(visibleProvidersForSnapshot(snapshot)).toEqual(["claude"]);
+  });
+
   it("keeps the latest row when a snapshot contains duplicate ids", () => {
     const first = { ...limit("codex"), id: "codex:spark", usedPercent: 1 };
     const latest = { ...first, usedPercent: 2, resetLabel: "latest reset" };

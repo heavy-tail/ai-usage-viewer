@@ -30,6 +30,8 @@ export type ProviderCollectorResult = {
   rawText: string;
   cleanedText: string;
   rawFileName: string;
+  adapterVersion?: string;
+  formatFingerprint?: string;
   error?: string;
 };
 

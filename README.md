@@ -4,30 +4,36 @@ Local dashboard for subscription quota and usage surfaced by AI CLI tools. It is
 for local OAuth/subscription usage screens, not API billing or token accounting.
 
 > **Shared as-is.** This is a personal tool published without warranty or
-> support. It reads usage by parsing each CLI's on-screen output, so a provider
-> changing its CLI can temporarily break a collector until its parser is updated.
+> support. It uses provider-local structured interfaces where available and
+> parses CLI output for the remaining providers, so a provider change can
+> temporarily break a collector until its adapter is updated.
 > Windows only.
 
 ## Supported Providers
 
-- Claude Code: `/usage` and `claude auth status`
-- OpenAI Codex: TUI footer from `codex --no-alt-screen`
-- Antigravity CLI (`agy`): `/quota`
-- Grok Build CLI (native Windows binary): quota read from the launch footer
+- Claude Code: accessibility-mode `/usage` output and `claude auth status`
+- OpenAI Codex: structured `account/rateLimits/read` through app-server, with
+  the TUI footer as a fallback for older builds
+- Antigravity CLI (`agy`): structured quota from its headless local service
+- Grok Build CLI (native Windows binary): weekly footer plus `/usage show`
 
-Collectors are best-effort because these CLIs expose usage through interactive
-terminal UIs. If a CLI is missing, logged out, times out, or changes output
-format, the app records `unavailable`, `error`, `stale`, or `drift` instead of
-guessing quota values.
+Collectors are best-effort because these are local provider interfaces rather
+than public billing APIs. If a CLI is missing, logged out, times out, or changes
+its response format, the app records `unavailable`, `error`, `stale`, or `drift`
+instead of guessing quota values.
 
 ## Install
 
 Requirements:
 
-- **Windows** (the collectors drive the CLIs through Windows pseudo-consoles)
-- **Node.js 18+** and npm
+- **Windows** (some collectors drive interactive CLIs through pseudo-consoles)
+- **Node.js 24 LTS** and npm
 - The provider CLIs you want to track, **installed and logged in**. You only need
   the ones you use — Claude Code, OpenAI Codex, Antigravity (`agy`), Grok Build.
+
+The first test, build, or start compiles a small local AGY process-containment
+helper with Windows' built-in .NET Framework compiler. The generated executable
+stays under ignored `.runtime/` state and is not published from the repository.
   Anything missing or logged out simply shows as unavailable.
 
 ```powershell
@@ -44,7 +50,18 @@ copy config.example.json config.json
 
 ## Run
 
-Start the local API:
+For normal use, build once and start the production server:
+
+```powershell
+npm run build
+npm start
+```
+
+Open `http://127.0.0.1:4317/`. One localhost process serves both the built
+dashboard and its `/api` routes, so production use does not need a Vite proxy or
+a second terminal.
+
+For UI development with Vite hot reload, start the local API:
 
 ```powershell
 npm run api
@@ -57,14 +74,7 @@ npm run dev
 ```
 
 Open the Vite URL printed by the command, usually `http://127.0.0.1:5173/`.
-The API listens on `http://127.0.0.1:4317` and is bound to localhost.
-
-> **Supported run mode:** `npm run dev` together with `npm run api` (or the
-> desktop shortcut, which starts both). `npm run build` / `npm run preview` are
-> for type-checking and bundle inspection only — the built bundle does not proxy
-> `/api`, so a static `dist/` cannot reach the collector API on its own. If a
-> hosted build is ever needed, serve `dist/` from `src/server.ts` or front both
-> with a reverse proxy.
+Vite proxies `/api` to `http://127.0.0.1:4317`; both servers bind to localhost.
 
 To collect once without opening the UI:
 
@@ -72,8 +82,48 @@ To collect once without opening the UI:
 npm run collect
 ```
 
-This writes `data/usage-snapshot.json` and redacted raw transcripts under
-`data/raw/`.
+This writes the privacy-filtered `data/usage-snapshot.json` and compatibility
+report. Full provider terminal transcripts are kept only in memory while a
+refresh runs; they are not persisted or exposed through the local API.
+
+The production server also runs a quiet compatibility refresh every six hours
+(override with `COMPATIBILITY_CHECK_INTERVAL_MINUTES`). Each successful result
+must pass the normalized adapter contract before it can replace the last
+verified rows. To run that canary immediately and receive a nonzero exit code on
+drift, use:
+
+```powershell
+npm run compatibility:check
+```
+
+For provider-side changes that happen without a repository commit,
+`.github/workflows/compatibility-canary.yml` defines a separate six-hour canary
+using two dedicated self-hosted Windows runner services:
+
+- `usage-viewer-canary` runs under a provider-test account. It may read the
+  canonical baseline directory but its Windows ACL must deny create, replace,
+  delete, and write access.
+- `usage-viewer-canary-writer` runs under a different Windows account with no
+  provider logins. It may replace the canonical baseline but never checks out or
+  executes repository/provider code.
+
+Both runner services point `USAGE_VIEWER_CANARY_BASELINE` at the same file
+outside their workspaces. The read-only runner should use the unprotected
+`compatibility-canary-readonly` environment. The writer uses
+`compatibility-canary`, which should require a reviewer and disallow
+self-review. Only the reader profile contains non-personal provider test
+sessions; personal OAuth sessions should never be copied to either runner or to
+GitHub-hosted CI.
+
+Scheduled runs compare against the baseline and upload only an allow-list
+redacted report. The independent GitHub-hosted watchdog manages the alert issue.
+To intentionally accept a provider-format change, run **Request compatibility
+baseline acceptance** from `main`, then approve the writer environment. The
+reader creates a structural candidate containing row IDs and format
+fingerprints—not accounts, quota values, resets, or provider text. The writer
+independently validates that candidate, confirms `main` has not advanced, and
+promotes it atomically. A missing/malformed baseline or an incorrect reader ACL
+fails closed.
 
 ## Desktop Shortcut
 
@@ -83,9 +133,13 @@ On Windows, generate icons and install the shortcut with:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-desktop-shortcut.ps1
 ```
 
-The shortcut starts the API and dashboard locally, opens an Edge/Chrome app
-window when available, and creates a startup shortcut for the local server. Logs
-go under `data/logs/`.
+The shortcut starts the single production server locally, opens an Edge/Chrome
+app window when available, and creates a startup shortcut for that server. If
+the production dashboard is missing or older than its source files, the launcher
+rebuilds it before starting. A versioned identity/fingerprint check replaces a
+verified older backend automatically, repairs missing launcher state, and never
+stops an unrelated process that happens to own the port. Logs go under
+`data/logs/`.
 
 ## Configuration
 
@@ -96,6 +150,7 @@ to choose providers and local defaults:
 - `codex.collectDefault`: collect account limits from the default Codex model
 - `agy.pinnedGroups`: optional filter for Antigravity model-group quota rows (e.g. `"Gemini Models"`); empty shows all
 - `grokCommand`: path to the native Grok CLI (defaults to `grok` on PATH; set an absolute path if it isn't on PATH)
+- `timezone`: IANA timezone used consistently for every displayed reset time
 - `planLabelFallback`: labels used when a provider does not expose plan text
 
 Machine-specific paths should stay in `config.json`; do not hardcode them in
@@ -106,12 +161,16 @@ source files.
 Runtime data is local and ignored by git:
 
 - `data/usage-snapshot.json`
-- `data/raw/*.txt`
+- `data/compatibility-report.json`
 - `data/logs/*`
 
-Snapshot and raw-output writes pass through redaction helpers for email,
-organization, account, and session-like identifiers. Raw CLI output can still
-contain account metadata before redaction, so keep `data/` out of commits.
+Snapshot and compatibility-report writes pass through redaction helpers for
+email, organization, account, session, and credential-like identifiers. CLI
+output can contain account metadata while a collector is running, so the app
+caps it in memory and does not save or serve full transcripts. Keep `data/` out
+of commits. Each Windows pseudo-terminal capture runs in its own short-lived,
+hidden worker so native terminal handles are closed even if a provider exits
+unexpectedly.
 
 The app does not read token files, cookies, browser sessions, or private web
 APIs. It only launches local CLI commands and parses their visible usage output.
@@ -124,15 +183,55 @@ npm run typecheck
 npm run build
 ```
 
-Expected coverage includes parser fixtures, collector behavior, refresh locking,
-snapshot shape, and redaction.
+Expected coverage includes current and historical parser fixtures, completeness
+checks, collector behavior, refresh locking, snapshot shape, and redaction.
+
+Pull requests and pushes to `main` run an exact install, full dependency audit,
+type-check, tests, production build, and an extracted-bundle smoke test on a
+Windows GitHub Actions runner with Node.js 24. Pull requests receive no release
+credentials.
+
+After a `main` run passes, its exact tested commit is bundled and attested. A
+separate workflow loaded from the protected default branch verifies that commit
+is still current, creates the version tag from `package.json`, and publishes the
+same immutable ZIP and checksum through the protected `release` environment.
+The publisher opens the ZIP before tagging and requires its embedded repository,
+exact tested commit, and package version to match; it also rejects releases with
+missing or extra assets.
+Release logic is never loaded from a pushed tag. Bump `package.json` before the
+next release; existing tags and assets are never moved or replaced. The bundle
+contains the built dashboard, local server source, and locked npm manifests; it
+still requires Windows, Node.js 24, and an `npm ci` after extraction. It is not
+a portable installer or an automatic desktop updater yet. Verify a downloaded
+archive with `gh attestation verify <archive> --repo heavy-tail/ai-usage-viewer`.
+
+Repository administrators must protect `main`, require the Windows verification
+check before merge, and configure the `release` environment for protected
+branches with at least one required reviewer and self-review disabled. Those
+GitHub settings are part of the release trust boundary and should be audited
+after any repository-administration change.
+
+For the repeatable external Sol Pro review process used on this project, see
+[docs/sol-pro-review-workflow.md](docs/sol-pro-review-workflow.md). It is a
+review gate around CI, not a replacement for tests or branch protection.
+
+A separate GitHub-hosted watchdog checks the provider canary hourly. It opens a
+managed issue if the self-hosted canary is queued or running too long, fails, or
+has no successful scheduled run within ten hours, and closes the issue after
+recovery. This keeps runner outages visible even when the runner itself cannot
+execute its normal issue-sync step.
 
 ## Known Limitations
 
-- CLI/TUI output can drift when provider CLIs update.
-- Windows only — the collectors rely on Windows pseudo-consoles.
+- A provider can still introduce genuinely new quota semantics that require a
+  new adapter release. The app detects incomplete/unknown sections, retains the
+  last verified values, and records a redacted compatibility report instead of
+  guessing or silently dropping rows.
+- Windows only: the collectors rely on Windows pseudo-consoles.
 - Login, workspace trust, and update prompts can make provider collection
   unavailable or stale until handled locally.
-- History charts, SQLite persistence, packaged desktop apps, browser automation
-  collectors, and background refresh are intentionally out of scope for this
-  MVP.
+- History charts, SQLite persistence, packaged desktop apps, and browser
+  automation collectors are intentionally out of scope for this MVP.
+- The compatibility report is ready for a separate repair worker to consume,
+  but this repository does not yet run an autonomous code-writing agent or
+  install releases automatically.

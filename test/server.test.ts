@@ -4,8 +4,14 @@ import { tmpdir } from "node:os";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
 import { describe, expect, it } from "vitest";
-import { createUsageServer } from "../src/server/app";
+import {
+  createUsageServer,
+  USAGE_SERVER_IDENTITY_VERSION,
+  USAGE_SERVER_SERVICE,
+  type UsageServerIdentity,
+} from "../src/server/app";
 import { RefreshInProgressError, type RefreshService } from "../src/refresh";
+import { tryAcquireRefreshLock } from "../src/refreshLock";
 import type { UsageSnapshot } from "../src/types";
 
 const validSnapshot: UsageSnapshot = {
@@ -34,7 +40,12 @@ async function workspace(): Promise<string> {
 }
 
 async function withServer(
-  opts: { rootDir: string; refresh?: RefreshService },
+  opts: {
+    rootDir: string;
+    staticDir?: string;
+    refresh?: RefreshService;
+    identity?: UsageServerIdentity;
+  },
   run: (base: string) => Promise<void>
 ): Promise<void> {
   const server: Server = createUsageServer(opts);
@@ -74,6 +85,31 @@ function rawRequest(
 }
 
 describe("usage server routes", () => {
+  it("GET /api/identity returns the launch-verification contract", async () => {
+    const rootDir = await workspace();
+    const identity: UsageServerIdentity = {
+      service: USAGE_SERVER_SERVICE,
+      version: USAGE_SERVER_IDENTITY_VERSION,
+      sourceFingerprint: "a".repeat(64),
+      pid: process.pid,
+      processStartedAtUtc: "2026-06-27T00:00:00.000Z",
+    };
+    await withServer({ rootDir, refresh: okRefresh, identity }, async (base) => {
+      const res = await fetch(`${base}/api/identity`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(identity);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    });
+  });
+
+  it("GET /api/identity is unavailable for intentionally API-only embeddings", async () => {
+    const rootDir = await workspace();
+    await withServer({ rootDir, refresh: okRefresh }, async (base) => {
+      const res = await fetch(`${base}/api/identity`);
+      expect(res.status).toBe(404);
+    });
+  });
+
   it("GET /api/snapshot returns the stored snapshot", async () => {
     const rootDir = await workspace();
     await writeFile(
@@ -89,7 +125,62 @@ describe("usage server routes", () => {
     });
   });
 
-  it("GET /api/snapshot returns 500 for an invalid stored shape", async () => {
+  it("GET /api/snapshot reports a refresh held by another process", async () => {
+    const rootDir = await workspace();
+    const release = await tryAcquireRefreshLock(rootDir);
+    expect(release).toBeTypeOf("function");
+    try {
+      await withServer({ rootDir, refresh: okRefresh }, async (base) => {
+        const res = await fetch(`${base}/api/snapshot`);
+        const body = (await res.json()) as { refreshing: boolean };
+        expect(body.refreshing).toBe(true);
+      });
+    } finally {
+      await release?.();
+    }
+  });
+
+  it("GET /api/snapshot ignores a stale cross-process refresh lock", async () => {
+    const rootDir = await workspace();
+    await writeFile(
+      join(rootDir, "data", "refresh.lock"),
+      JSON.stringify({
+        pid: 2_147_483_647,
+        token: "stale-test",
+        startedAt: "2026-06-27T00:00:00.000Z",
+      }),
+      "utf8"
+    );
+    await withServer({ rootDir, refresh: okRefresh }, async (base) => {
+      const res = await fetch(`${base}/api/snapshot`);
+      const body = (await res.json()) as { refreshing: boolean };
+      expect(body.refreshing).toBe(false);
+    });
+  });
+
+  it("GET /api/snapshot exposes the completed background refresh error", async () => {
+    const rootDir = await workspace();
+    const failedRefresh: RefreshService = {
+      refresh: async () => {
+        throw new Error("provider collection failed");
+      },
+      isRunning: () => false,
+      lastError: () => "provider collection failed",
+    };
+    await withServer({ rootDir, refresh: failedRefresh }, async (base) => {
+      const res = await fetch(`${base}/api/snapshot`);
+      const body = (await res.json()) as {
+        refreshing: boolean;
+        error?: string;
+      };
+      expect(body).toMatchObject({
+        refreshing: false,
+        error: "provider collection failed",
+      });
+    });
+  });
+
+  it("GET /api/snapshot surfaces storage corruption instead of an empty state", async () => {
     const rootDir = await workspace();
     await writeFile(
       join(rootDir, "data", "usage-snapshot.json"),
@@ -99,6 +190,8 @@ describe("usage server routes", () => {
     await withServer({ rootDir, refresh: okRefresh }, async (base) => {
       const res = await fetch(`${base}/api/snapshot`);
       expect(res.status).toBe(500);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toMatch(/could not complete/i);
     });
   });
 
@@ -112,7 +205,7 @@ describe("usage server routes", () => {
     });
   });
 
-  it("serves stored raw output and 404s when missing", async () => {
+  it("does not expose legacy raw collector transcripts", async () => {
     const rootDir = await workspace();
     await writeFile(
       join(rootDir, "data", "raw", "claude.txt"),
@@ -121,25 +214,48 @@ describe("usage server routes", () => {
     );
     await withServer({ rootDir, refresh: okRefresh }, async (base) => {
       const present = await fetch(`${base}/api/raw/claude`);
-      expect(present.status).toBe(200);
-      expect(await present.text()).toContain("hello raw");
+      expect(present.status).toBe(404);
+      expect(await present.text()).not.toContain("hello raw");
 
       const missing = await fetch(`${base}/api/raw/grok`);
       expect(missing.status).toBe(404);
     });
   });
 
-  it("POST /api/refresh returns the new snapshot", async () => {
+  it("POST /api/refresh starts the server-owned refresh without waiting for it", async () => {
     const rootDir = await workspace();
-    await withServer({ rootDir, refresh: okRefresh }, async (base) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let running = false;
+    let calls = 0;
+    const backgroundRefresh: RefreshService = {
+      refresh: async () => {
+        calls += 1;
+        running = true;
+        await pending;
+        running = false;
+        return validSnapshot;
+      },
+      isRunning: () => running,
+    };
+
+    await withServer({ rootDir, refresh: backgroundRefresh }, async (base) => {
       const res = await fetch(`${base}/api/refresh`, { method: "POST" });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(202);
       const body = (await res.json()) as {
         snapshot: UsageSnapshot;
         refreshing: boolean;
       };
-      expect(body.refreshing).toBe(false);
-      expect(body.snapshot.generatedAt).toBe(validSnapshot.generatedAt);
+      expect(body.refreshing).toBe(true);
+      expect(calls).toBe(1);
+
+      const during = await fetch(`${base}/api/snapshot`);
+      expect(await during.json()).toMatchObject({ refreshing: true });
+      release();
+      await pending;
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
   });
 
@@ -180,7 +296,7 @@ describe("usage server routes", () => {
     });
   });
 
-  it("allows requests from a loopback Origin", async () => {
+  it("allows requests only from the exact dashboard origin", async () => {
     const rootDir = await workspace();
     await writeFile(
       join(rootDir, "data", "usage-snapshot.json"),
@@ -189,9 +305,70 @@ describe("usage server routes", () => {
     );
     await withServer({ rootDir, refresh: okRefresh }, async (base) => {
       const status = await rawRequest(base, "/api/snapshot", {
-        headers: { Origin: "http://localhost:5173" },
+        headers: { Origin: base },
       });
       expect(status).toBe(200);
+
+      const otherPort = await rawRequest(base, "/api/snapshot", {
+        headers: { Origin: "http://127.0.0.1:5173" },
+      });
+      expect(otherPort).toBe(403);
+
+      const otherLoopbackName = await rawRequest(base, "/api/snapshot", {
+        headers: { Origin: `http://localhost:${new URL(base).port}` },
+      });
+      expect(otherLoopbackName).toBe(403);
+    });
+  });
+
+  it("serves the built dashboard and assets without changing API routing", async () => {
+    const rootDir = await workspace();
+    const staticDir = join(rootDir, "dist");
+    await mkdir(join(staticDir, "assets"), { recursive: true });
+    await writeFile(join(staticDir, "index.html"), '<main id="root">viewer</main>', "utf8");
+    await writeFile(join(staticDir, "assets", "app.js"), "export {};", "utf8");
+
+    await withServer({ rootDir, staticDir, refresh: okRefresh }, async (base) => {
+      const dashboard = await fetch(`${base}/`);
+      expect(dashboard.status).toBe(200);
+      expect(dashboard.headers.get("content-type")).toContain("text/html");
+      expect(dashboard.headers.get("cache-control")).toBe("no-cache");
+      expect(await dashboard.text()).toContain('id="root"');
+
+      const asset = await fetch(`${base}/assets/app.js`);
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get("content-type")).toContain("text/javascript");
+      expect(asset.headers.get("cache-control")).toContain("immutable");
+
+      const api = await fetch(`${base}/api/snapshot`);
+      expect(api.status).toBe(200);
+      expect(api.headers.get("content-type")).toContain("application/json");
+
+      const unknownApi = await fetch(`${base}/api/not-a-route`);
+      expect(unknownApi.status).toBe(404);
+      expect(unknownApi.headers.get("content-type")).toContain("application/json");
+    });
+  });
+
+  it("supports HEAD requests and does not expose files outside dist", async () => {
+    const rootDir = await workspace();
+    const staticDir = join(rootDir, "dist");
+    await mkdir(staticDir, { recursive: true });
+    await writeFile(join(staticDir, "index.html"), "dashboard", "utf8");
+    await writeFile(join(rootDir, "private.txt"), "do not serve", "utf8");
+
+    await withServer({ rootDir, staticDir, refresh: okRefresh }, async (base) => {
+      const head = await fetch(`${base}/`, { method: "HEAD" });
+      expect(head.status).toBe(200);
+      expect(head.headers.get("content-length")).toBe(String("dashboard".length));
+      expect(await head.text()).toBe("");
+
+      const missing = await fetch(`${base}/private.txt`);
+      expect(missing.status).toBe(404);
+
+      const encodedTraversal = await fetch(`${base}/%2e%2e%5cprivate.txt`);
+      expect([403, 404]).toContain(encodedTraversal.status);
+      expect(await encodedTraversal.text()).not.toContain("do not serve");
     });
   });
 });

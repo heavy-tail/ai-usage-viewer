@@ -22,6 +22,9 @@ export function validateSnapshotShape(value: unknown): value is UsageSnapshot {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as UsageSnapshot;
   if (typeof snapshot.generatedAt !== "string") return false;
+  if (snapshot.timezone !== undefined && typeof snapshot.timezone !== "string") {
+    return false;
+  }
   if (!Array.isArray(snapshot.collectors) || !Array.isArray(snapshot.limits)) {
     return false;
   }
@@ -30,10 +33,23 @@ export function validateSnapshotShape(value: unknown): value is UsageSnapshot {
     snapshot.collectors.every((collector) => {
       return (
         PROVIDERS.includes(collector.provider) &&
+        (collector.enabled === undefined ||
+          typeof collector.enabled === "boolean") &&
         typeof collector.ok === "boolean" &&
         COLLECTOR_STATES.includes(collector.state) &&
+        validAttemptState(
+          (collector as { attemptState?: unknown }).attemptState
+        ) &&
         typeof collector.checkedAt === "string" &&
-        typeof collector.durationMs === "number"
+        typeof collector.durationMs === "number" &&
+        (collector.adapterVersion === undefined ||
+          typeof collector.adapterVersion === "string") &&
+        (collector.formatFingerprint === undefined ||
+          typeof collector.formatFingerprint === "string") &&
+        (collector.formatChanged === undefined ||
+          typeof collector.formatChanged === "boolean") &&
+        (collector.rowInventoryChanged === undefined ||
+          typeof collector.rowInventoryChanged === "boolean")
       );
     }) &&
     snapshot.limits.every((limit) => {
@@ -43,10 +59,24 @@ export function validateSnapshotShape(value: unknown): value is UsageSnapshot {
         typeof limit.providerLabel === "string" &&
         typeof limit.scope === "string" &&
         LIMIT_STATUSES.includes(limit.status) &&
+        (limit.blockingReason === undefined ||
+          typeof limit.blockingReason === "string") &&
+        (limit.freshness === undefined ||
+          limit.freshness === "verified" ||
+          limit.freshness === "stale") &&
         typeof limit.sourceCommand === "string" &&
         typeof limit.sourceText === "string" &&
         typeof limit.checkedAt === "string"
       );
     })
+  );
+}
+
+function validAttemptState(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "string" &&
+      value !== "stale" &&
+      COLLECTOR_STATES.includes(value as CollectorState))
   );
 }

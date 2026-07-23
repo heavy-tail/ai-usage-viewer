@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { parseGrokUsage } from "../parsers/grok";
+import { localSourceTimeZone } from "../parsers/common";
 import { CollectorUnavailableError } from "./errors";
-import { isCommandAvailable } from "./command";
+import { resolveCommandPath } from "./command";
 import { failedResult, okResult } from "./helpers";
 import type { CollectorContext, ProviderCollectorResult } from "./types";
 
@@ -16,14 +17,22 @@ export async function collectGrok(
   // Grok runs as a native Windows binary now (was routed through WSL, which
   // popped a console window when WSL cold-started). `grokCommand` is "grok" by
   // default and can be an absolute path in config.json when it isn't on PATH.
-  const command = context.config.grokCommand ?? "grok";
+  const configuredCommand = context.config.grokCommand ?? "grok";
 
   try {
-    const available = isAbsolute(command)
-      ? existsSync(command)
-      : await isCommandAvailable(command, context.rootDir, context.commandRunner);
-    if (!available) {
-      throw new CollectorUnavailableError(`Grok CLI (${command}) is not installed.`);
+    const command = isAbsolute(configuredCommand)
+      ? existsSync(configuredCommand)
+        ? configuredCommand
+        : undefined
+      : await resolveCommandPath(
+          configuredCommand,
+          context.rootDir,
+          context.commandRunner
+        );
+    if (!command) {
+      throw new CollectorUnavailableError(
+        `Grok CLI (${configuredCommand}) is not installed.`
+      );
     }
 
     const pty = await context.ptyRunner({
@@ -32,15 +41,24 @@ export async function collectGrok(
       cwd: context.rootDir,
       totalTimeoutMs: 30_000,
       steps: [
-        // Grok moved quota behind `/usage show` ("View credit usage"). Wait for
-        // the composer to draw, then run it by opening the slash autocomplete
-        // ("/usage " leaves "show" highlighted) and pressing Enter. Typing "show"
-        // ourselves collides with the completion and errors ("Unknown argument").
-        { waitFor: /Composer 2\.5|❯|\d+\s*\/\s*\d+K/i, timeoutMs: 15_000 },
-        { delayMs: 3_500 },
-        { send: "/usage ", delayMs: 1_500 },
-        { send: "\r", delayMs: 300 },
-        { waitFor: /Monthly limit:\s*\d/i, timeoutMs: 12_000 },
+        // Quota warnings are conditional and may be weekly or monthly. The
+        // prompt marker is the stable signal that the current public Grok Build
+        // TUI is ready to accept a slash command, regardless of usage level.
+        {
+          waitFor:
+            /(?:(?:│|\|)\s*>|(?:^|[\r\n])\s*>)\s*(?:Type a message\.\.\.)?/m,
+          timeoutMs: 15_000,
+        },
+        { delayMs: 300 },
+        // Submit the complete slash command directly. Driving the completion
+        // menu introduced rotating suggestion/status redraws into ConPTY and
+        // occasionally selected no action at all, making refresh flaky.
+        { send: "/usage show\r", delayMs: 300 },
+        {
+          waitFor:
+            /(?:(?:(?:Monthly|Weekly) limit|Usage):\s*\d|Login with Grok|error sending request[^\r\n]*auth\.x\.ai)/i,
+          timeoutMs: 12_000,
+        },
         { delayMs: 300 },
         { send: "/quit\r", delayMs: 100 },
       ],
@@ -53,10 +71,22 @@ export async function collectGrok(
         pty.cleanedOutput
       );
     }
+    if (
+      /Login with Grok|error sending request[^\r\n]*auth\.x\.ai/i.test(
+        pty.cleanedOutput
+      )
+    ) {
+      throw new CollectorUnavailableError(
+        "Grok CLI could not authenticate with xAI.",
+        pty.rawOutput,
+        pty.cleanedOutput
+      );
+    }
 
     const meta = {
       checkedAt,
-      sourceCommand: "grok -> /usage show",
+      sourceCommand: "grok -> quota footer + /usage show",
+      sourceTimeZone: localSourceTimeZone(),
       planLabel: context.config.planLabelFallback.grok ?? "SuperGrok",
     };
 
