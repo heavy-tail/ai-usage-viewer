@@ -89,8 +89,9 @@ jobs:
           managed="$(jq -c --arg marker "$marker" \
             '[.[][] | select(has("pull_request") | not) | select((.body // "") | contains($marker))] | sort_by(.number) | first // empty' \
             <<<"$issues")"
-          issue_number="$(jq -r '.number // empty' <<<"${managed:-{}}")"
-          issue_state="$(jq -r '.state // empty' <<<"${managed:-{}}")"
+          managed_json="${managed:-null}"
+          issue_number="$(jq -r '.number // empty' <<<"$managed_json")"
+          issue_state="$(jq -r '.state // empty' <<<"$managed_json")"
           body_file="$RUNNER_TEMP/canary-watchdog-issue.md"
           cat >"$body_file" <<EOF
           $marker

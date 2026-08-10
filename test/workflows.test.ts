@@ -91,6 +91,8 @@ describe("privileged compatibility workflows", () => {
     expect(watchdog).toContain("age_seconds -gt 2700");
     expect(watchdog).toContain("success_age -gt 36000");
     expect(watchdog).toContain("issues: write");
+    expect(watchdog).toContain('managed_json="${managed:-null}"');
+    expect(watchdog).not.toContain("managed:-{}");
   });
 
   it("binds each published archive and exact asset inventory to the tested commit", async () => {
